@@ -78,6 +78,6 @@ Please report security vulnerabilities, unsafe behavior, or hardware/firmware is
 
 ## Contact
 
-- Commercial licensing: `[licensing contact]`
-- Security or safety reports: `[security contact]`
-- General CryoSnap questions: `[project contact]`
+- Commercial licensing: `info@sheetak.com`
+- Security or safety reports: `info@sheetak.com`
+- General CryoSnap questions: `info@sheetak.com`
