@@ -49,7 +49,7 @@ Sheetak may also offer paid commercial licenses, production licenses, support ag
 Send a request to:
 
 ```text
-[licensing contact]
+info@sheetak.com
 ```
 
 Please include:
