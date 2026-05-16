@@ -1,0 +1,14 @@
+# Bash scripts must use LF endings — Git Bash on Windows refuses to
+# run a script with CRLF line endings (`$'\r': command not found`).
+*.sh text eol=lf
+
+# C/C++ source and headers compile fine either way; pick LF for
+# consistency across platforms and to avoid the noisy "LF will be
+# replaced by CRLF" warnings on every commit.
+*.c    text eol=lf
+*.cpp  text eol=lf
+*.h    text eol=lf
+*.ino  text eol=lf
+
+# Markdown — LF for cross-platform diffs.
+*.md   text eol=lf
