@@ -1,0 +1,68 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Build outputs
+build/
+dist/
+out/
+bin/
+obj/
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.a
+*.d
+*.lst
+
+# Logs/temp
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Secrets/config
+.env
+.env.*
+secrets.*
+credentials.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+*.token
+config.local.*
+wifi_config.*
+private_config.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node, if docs/tools use it
+node_modules/
+
+# KiCad generated/local files
+*-backups/
+*.kicad_prl
+*.kicad_pro-bak
+*.kicad_sch-bak
+*.kicad_pcb-bak
+fp-info-cache
+
+# Manufacturing exports unless intentionally released
+gerbers/
+fab/
+fabrication/private/
+production/
+test-jigs/
+factory-calibration/
