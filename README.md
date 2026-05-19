@@ -4,7 +4,7 @@ CryoSnap is a Sheetak thermoelectric validation platform for moving from bench t
 
 > **Status:** Public reference design / community edition.
 >
-> CryoSnap is made available to encourage personal, educational, research, evaluation, and internal use. It is **source-available**, not an OSI-approved open source project. Commercial sale, paid distribution, or integration into a commercial product requires prior written authorization from Sheetak.
+> CryoSnap is made available to encourage personal, educational, research, evaluation, and internal use. It is **source-available**, not an OSI-approved open source project. Modifications are allowed. Attribution is required. Commercial sale, paid distribution, or integration into a commercial product requires prior written authorization from Sheetak.
 
 ## What is included
 
