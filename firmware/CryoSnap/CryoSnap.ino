@@ -154,6 +154,14 @@ static uint8_t  g_fault = FAULT_NONE;
 #define HUSB_FAULT_DEBOUNCE  5   // ticks (500 ms at 100 ms cadence)
 static uint8_t _husb_fault_count = 0;
 
+// Sticky: set true the first tick HUSB238 reports any negotiated
+// voltage. Stays false on a direct-supply boot (DC input into the
+// barrel jack with no USB-C source), which lets us skip the PD
+// fault chain in that case — losing a contract you never had is
+// not a fault. If a PD source IS plugged in and later disconnects,
+// the flag is already true and the fault chain still catches it.
+static bool _husb_was_attached = false;
+
 // ---- button debounce state ----------------------------------------------
 
 static bool     _btn_last_raw   = HIGH;  // active-low button
@@ -542,13 +550,26 @@ static void task_100ms() {
 #if HAS_HUSB238 && ENABLE_SAFETY_FAULTS
   {
     uint8_t pdv = husb_negotiatedV();
+    if (pdv >= 5) {
+      // PD source has appeared at least once. From here on we treat
+      // PD loss as a real fault. The flag is sticky — unplugging the
+      // PD source later does not clear it.
+      _husb_was_attached = true;
+    }
     if (pdv < 20) {
-      if (_husb_fault_count == 0) {
-        // First tick below 20V — try to re-negotiate immediately.
-        _husb_write(HUSB_REG_SRC_PDO,    HUSB_PDO_SEL_20V);
-        _husb_write(HUSB_REG_GO_COMMAND, HUSB_CMD_REQUEST_PDO);
+      if (!_husb_was_attached) {
+        // No PD source has ever been seen — the device is running
+        // off a direct DC supply (e.g. 24 V into the barrel jack).
+        // Losing a contract we never had is not a fault.
+        _husb_fault_count = 0;
+      } else {
+        if (_husb_fault_count == 0) {
+          // First tick below 20V — try to re-negotiate immediately.
+          _husb_write(HUSB_REG_SRC_PDO,    HUSB_PDO_SEL_20V);
+          _husb_write(HUSB_REG_GO_COMMAND, HUSB_CMD_REQUEST_PDO);
+        }
+        _husb_fault_count++;
       }
-      _husb_fault_count++;
     } else {
       _husb_fault_count = 0;
     }
