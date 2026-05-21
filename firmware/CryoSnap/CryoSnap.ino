@@ -242,6 +242,13 @@ static void _pd_reinit() {
 #endif
   tps_init();
   _husb_fault_count = 0;
+  // Re-arm the sticky "PD ever attached" detector. If the operator
+  // is re-enabling after a PD fault (cable knocked loose, source
+  // switched out for a direct DC supply), this lets the firmware
+  // reassess the supply from scratch instead of carrying the stale
+  // "was attached" verdict — which would otherwise re-fault on the
+  // next tick if PD is genuinely gone now.
+  _husb_was_attached = false;
 }
 
 // =========================================================================

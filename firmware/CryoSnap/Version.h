@@ -21,6 +21,12 @@
       FAULT_HUSB_20V chain now only counts when the flag is set,
       so "never had PD" cannot fault. PD-loss after attach (the
       real failure case) still trips normally.
+    - `_pd_reinit()` clears the sticky flag on every enable
+      rising edge. This lets the operator re-enable after a PD
+      fault and have the firmware reassess the supply from
+      scratch — e.g. if the cable was swapped out for a direct
+      DC supply, the next enable comes up clean instead of
+      re-faulting on the stale "was attached" verdict.
     - No new config or console command; behaviour is automatic.
 
   0.7.3  2026-05-11  `controller` one-shot user-function hook
