@@ -4,11 +4,30 @@
 // Firmware version — update on each meaningful change.
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  3
-#define FW_VERSION_STR    "0.7.3"
+#define FW_VERSION_PATCH  4
+#define FW_VERSION_STR    "0.7.4"
 
 /*
   Changelog (newest first):
+
+  0.7.4  2026-05-21  Direct-supply boot no longer trips PD fault
+    - On a bench rig powered from a direct DC supply (e.g. 24 V
+      into the barrel jack with no USB-C source attached), the
+      HUSB238 reports unattached / 0 V. The FAULT_HUSB_20V chain
+      was counting every tick toward the fault and latching
+      within 500 ms of the first enable.
+    - New sticky `_husb_was_attached` flag flips true the first
+      tick HUSB reports any negotiated voltage (>= 5 V). The
+      FAULT_HUSB_20V chain now only counts when the flag is set,
+      so "never had PD" cannot fault. PD-loss after attach (the
+      real failure case) still trips normally.
+    - `_pd_reinit()` clears the sticky flag on every enable
+      rising edge. This lets the operator re-enable after a PD
+      fault and have the firmware reassess the supply from
+      scratch — e.g. if the cable was swapped out for a direct
+      DC supply, the next enable comes up clean instead of
+      re-faulting on the stale "was attached" verdict.
+    - No new config or console command; behaviour is automatic.
 
   0.7.3  2026-05-11  `controller` one-shot user-function hook
     - Scaffolded "controller" console command that fires
