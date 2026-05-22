@@ -4,11 +4,67 @@
 // Firmware version — update on each meaningful change.
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  3
-#define FW_VERSION_STR    "0.7.3"
+#define FW_VERSION_PATCH  5
+#define FW_VERSION_STR    "0.7.5"
 
 /*
   Changelog (newest first):
+
+  0.7.5  2026-05-22  Sticky supply-fault counter — catches oscillating chip
+    - The 0.7.4 supply-sufficiency check (periodic V_limit re-read
+      with symmetric debounce-2) never fired on bench: the TPS55288
+      oscillates between "trying to drive at the commanded V_limit"
+      and "protected at 5 V" because the firmware re-writes V_limit
+      every 100 ms tick. A symmetric debounce kept resetting to 0
+      on the "trying" tick and never accumulated.
+    - Drop the reset-on-good branch while the firmware is actively
+      driving. The counter is now sticky: any two bad reads anywhere
+      during a drive session latch FAULT_NO_SUPPLY. Good reads while
+      not driving still reset (so a fresh enable starts clean).
+    - No new config or behaviour change; just makes the detection
+      that 0.7.4 intended actually work.
+
+  0.7.4  2026-05-21  Direct-supply boot no longer trips PD fault
+    - On a bench rig powered from a direct DC supply (e.g. 24 V
+      into the barrel jack with no USB-C source attached), the
+      HUSB238 reports unattached / 0 V. The FAULT_HUSB_20V chain
+      was counting every tick toward the fault and latching
+      within 500 ms of the first enable.
+    - New sticky `_husb_was_attached` flag flips true the first
+      tick HUSB reports any negotiated voltage (>= 5 V). The
+      FAULT_HUSB_20V chain now only counts when the flag is set,
+      so "never had PD" cannot fault. PD-loss after attach (the
+      real failure case) still trips normally.
+    - `_pd_reinit()` clears the sticky flag on every enable
+      rising edge. This lets the operator re-enable after a PD
+      fault and have the firmware reassess the supply from
+      scratch — e.g. if the cable was swapped out for a direct
+      DC supply, the next enable comes up clean instead of
+      re-faulting on the stale "was attached" verdict.
+    - No new config or console command; behaviour is automatic.
+
+    - New FAULT_NO_SUPPLY (code 6) — catches the case where
+      there is neither USB-PD nor a sufficient Vin (~12 V) to
+      drive the TEC. Without this check the previous fixes
+      correctly skip the false-positive PD fault but the user
+      then enables and gets silent nothing because the TPS55288
+      can't sustain the commanded voltage.
+      Detection: when the firmware just wrote
+      V_limit = g_vmax_mV and turned OE on, the TPS silently
+      snaps V_limit back to its 5 V safety default if the supply
+      can't actually sustain. The next task_100ms tick reads
+      V_limit back; <= 5.5 V means the chip auto-reset. Two
+      consecutive bad reads (200 ms) plus the same FAULT_GRACE_MS
+      window the fan tach uses (3 s post-enable) latch the fault.
+      Bench-validated: a low-current synchronous probe at enable
+      did NOT trigger the chip's protection (it can hold 12 V
+      into a tiny load), so the only reliable signal is to
+      observe V_limit while the chip is actually driving at the
+      user-configured current.
+      Operator message:
+        "USBPD not available and supply voltage is insufficient
+         (connect to USBPD or Vin > 12v)"
+      OLED + serial labels: "NoPSU".
 
   0.7.3  2026-05-11  `controller` one-shot user-function hook
     - Scaffolded "controller" console command that fires

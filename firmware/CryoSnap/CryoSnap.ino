@@ -145,6 +145,7 @@ static bool     g_use_pid    = DEFAULT_USE_PID;     // true = PID, false = bang-
 #define FAULT_TPS_PG     3   // TPS55288 power-good / fault pin (A0)
 #define FAULT_HUSB_20V   4   // HUSB238 lost 20V PD contract
 #define FAULT_FAN_TACH   5   // fan tach reports 0 RPM while enabled
+#define FAULT_NO_SUPPLY  6   // TPS auto-reset Vlim under drive — no PD and Vin < ~12 V
 
 static uint8_t  g_fault = FAULT_NONE;
 
@@ -153,6 +154,23 @@ static uint8_t  g_fault = FAULT_NONE;
 // renegotiation shouldn't trip the fault.
 #define HUSB_FAULT_DEBOUNCE  5   // ticks (500 ms at 100 ms cadence)
 static uint8_t _husb_fault_count = 0;
+
+// Sticky: set true the first tick HUSB238 reports any negotiated
+// voltage. Stays false on a direct-supply boot (DC input into the
+// barrel jack with no USB-C source), which lets us skip the PD
+// fault chain in that case — losing a contract you never had is
+// not a fault. If a PD source IS plugged in and later disconnects,
+// the flag is already true and the fault chain still catches it.
+static bool _husb_was_attached = false;
+
+// Supply-sufficiency check state — used by the periodic V_limit
+// readback in task_100ms. See the long comment near the check
+// itself for the rationale; declared up here so _pd_reinit() can
+// reset both on every enable rising edge.
+#define SUPPLY_VLIM_FLOOR    5500  // mV — V_limit at or below this after a drive attempt = chip auto-reset
+#define SUPPLY_FAULT_DEBOUNCE   2  // bad reads anywhere in the drive session before latching
+static uint8_t _supply_fault_count    = 0;
+static bool    _tried_drive_last_tick = false;
 
 // ---- button debounce state ----------------------------------------------
 
@@ -234,7 +252,47 @@ static void _pd_reinit() {
 #endif
   tps_init();
   _husb_fault_count = 0;
+  // Re-arm the sticky "PD ever attached" detector. If the operator
+  // is re-enabling after a PD fault (cable knocked loose, source
+  // switched out for a direct DC supply), this lets the firmware
+  // reassess the supply from scratch instead of carrying the stale
+  // "was attached" verdict — which would otherwise re-fault on the
+  // next tick if PD is genuinely gone now.
+  _husb_was_attached = false;
+  // Fresh start for the periodic Vlim-readback supply check. tps_init
+  // above leaves Vlim at the safe 5 V default, so we need to wait
+  // for at least one real drive attempt before judging.
+  _supply_fault_count    = 0;
+  _tried_drive_last_tick = false;
 }
+
+// =========================================================================
+// Supply-sufficiency check — runs every 100 ms tick whenever the
+// firmware just attempted to drive the TEC.
+//
+// Why a periodic check instead of a synchronous probe at enable: the
+// TPS55288 only resets its V_limit to the 5 V safety default once it
+// has actually attempted to regulate at the commanded voltage AND
+// can't sustain it under real load. A low-current probe at enable
+// time doesn't trigger the protection (the chip can hold 12 V into
+// any load if there's nothing actually being drawn), so the only
+// reliable signal is to observe Vlim while the chip is genuinely
+// driving the TEC at the user-configured current.
+//
+// Mechanism: each tick where we wrote `tps_setVoltageLimit(g_vmax_mV)`
+// and turned OE on, the next tick reads V_limit back. If g_vmax_mV
+// asked for > 5 V but the chip reset itself to ~5 V, the upstream
+// supply is insufficient (no USB-PD AND Vin is missing or below
+// ~12 V). The counter is sticky on bad reads while driving (the
+// chip oscillates as the firmware re-writes V_limit each tick, so a
+// symmetric debounce never accumulates); SUPPLY_FAULT_DEBOUNCE bad
+// reads anywhere in the drive session latch FAULT_NO_SUPPLY.
+//
+// State (SUPPLY_VLIM_FLOOR, SUPPLY_FAULT_DEBOUNCE,
+// _supply_fault_count, _tried_drive_last_tick) is declared up in the
+// runtime-state block near the top of the file so _pd_reinit() can
+// reset both counters on every enable rising edge.
+// =========================================================================
 
 // =========================================================================
 // setup() — runs once at power-on. Bring up hardware in a safe order:
@@ -542,16 +600,54 @@ static void task_100ms() {
 #if HAS_HUSB238 && ENABLE_SAFETY_FAULTS
   {
     uint8_t pdv = husb_negotiatedV();
+    if (pdv >= 5) {
+      // PD source has appeared at least once. From here on we treat
+      // PD loss as a real fault. The flag is sticky — unplugging the
+      // PD source later does not clear it.
+      _husb_was_attached = true;
+    }
     if (pdv < 20) {
-      if (_husb_fault_count == 0) {
-        // First tick below 20V — try to re-negotiate immediately.
-        _husb_write(HUSB_REG_SRC_PDO,    HUSB_PDO_SEL_20V);
-        _husb_write(HUSB_REG_GO_COMMAND, HUSB_CMD_REQUEST_PDO);
+      if (!_husb_was_attached) {
+        // No PD source has ever been seen — the device is running
+        // off a direct DC supply (e.g. 24 V into the barrel jack).
+        // Losing a contract we never had is not a fault.
+        _husb_fault_count = 0;
+      } else {
+        if (_husb_fault_count == 0) {
+          // First tick below 20V — try to re-negotiate immediately.
+          _husb_write(HUSB_REG_SRC_PDO,    HUSB_PDO_SEL_20V);
+          _husb_write(HUSB_REG_GO_COMMAND, HUSB_CMD_REQUEST_PDO);
+        }
+        _husb_fault_count++;
       }
-      _husb_fault_count++;
     } else {
       _husb_fault_count = 0;
     }
+  }
+#endif
+
+  // Supply-sufficiency tracker. Only meaningful when we actually
+  // attempted to drive in the previous tick — that's when the TPS
+  // either holds the commanded Vlim or auto-resets to its 5 V
+  // safety default (the signal Jon identified on bench 2026-05-22).
+  // Skip entirely when the user has configured Vmax at or below
+  // the floor; in that range the chip will hold the request
+  // regardless of supply, so the "reset to 5 V" signal is moot.
+#if ENABLE_SAFETY_FAULTS
+  if (_tried_drive_last_tick && g_vmax_mV > SUPPLY_VLIM_FLOOR) {
+    if (tps_getVoltageLimitMV() <= SUPPLY_VLIM_FLOOR) {
+      _supply_fault_count++;
+    }
+    // No reset on a good read while we're driving: the TPS oscillates
+    // briefly between "trying to drive at Vmax" and "protected at 5 V"
+    // because the firmware re-writes V_limit every tick. A symmetric
+    // debounce would never trip — we'd alternate 5 V / 12 V / 5 V /
+    // 12 V. Sticky accumulation guarantees that any two bad reads
+    // during the drive session (consecutive or not) latch the fault.
+  } else {
+    // Not driving — chip's V_limit reading is meaningless. Reset so a
+    // fresh enable starts the assessment from zero.
+    _supply_fault_count = 0;
   }
 #endif
 
@@ -615,7 +711,28 @@ static void task_100ms() {
     }
 #endif
 
-    // (e) Fan tach failure: RPM = 0 while fan should be spinning.
+    // (e) Supply insufficient — TPS auto-reset V_limit to its 5 V
+    //     safety default for SUPPLY_FAULT_DEBOUNCE consecutive ticks
+    //     of attempted drive. Catches the Nano-on-PC-USB-only case
+    //     (no Vin, no USB-PD) that the earlier fixes correctly let
+    //     past the PD fault chain — without this check the user
+    //     sees enable accepted and then silent nothing because the
+    //     chip can't sustain the commanded voltage.
+    //     Skipped during the post-enable grace period (same window
+    //     the fan tach check uses) so soft-start + fan spin-up have
+    //     room to complete before we judge the supply.
+    else if (_supply_fault_count >= SUPPLY_FAULT_DEBOUNCE
+             && (millis() - _enable_time) > FAULT_GRACE_MS) {
+      g_fault = FAULT_NO_SUPPLY;
+      g_enabled = false;
+#if COMPACT_FAULT_MSGS
+      Serial.println(F("FLT[6]"));
+#else
+      Serial.println(F("FAULT[NOPSU]: USBPD not available and supply voltage is insufficient (connect to USBPD or Vin > 12v)"));
+#endif
+    }
+
+    // (f) Fan tach failure: RPM = 0 while fan should be spinning.
     //     Only check if fan speed is set above the minimum duty.
     //     Skip during the grace period after enable — the tach polling
     //     runs every 1 s and needs time to produce a first valid reading.
@@ -777,9 +894,11 @@ static void task_100ms() {
     tps_setVoltageLimit(g_vmax_mV);
     hb_safeDirectionChange(drive_dir);
     tps_setOutput(true);
+    _tried_drive_last_tick = true;   // arm the supply-Vlim check for next tick
   } else {
     tps_setOutput(false);
-    hb_setDirection(HB_COOL);  // safe default when off
+    hb_setDirection(HB_COOL);        // safe default when off
+    _tried_drive_last_tick = false;  // chip's Vlim reading is meaningless when not driving
   }
 
   // Fan runs at the configured speed when enabled. When disabled, it

@@ -128,6 +128,28 @@ inline void tps_setCurrentLimit(uint16_t mA) {
   _tps_write(TPS_REG_IOUT_LIMIT, 0x80 | (steps & 0x7F));
 }
 
+// Read the *currently active* output voltage limit back from the chip,
+// in millivolts. Reconstructed from VREF_L / VREF_H (10-bit reference
+// code) and VOUT_FS (range select) using the same math as
+// tps_setVoltageLimit() in reverse.
+//
+// Used by the supply-detection probe: when Vin is insufficient to
+// hold the commanded Vlim, the TPS55288 silently snaps Vlim back to
+// its 5 V default after OE is asserted. Reading Vlim back after a
+// brief OE pulse is the firmware's only reliable signal that the
+// upstream supply (USB-PD or direct Vin) is actually adequate for
+// 12 V TEC drive.
+inline uint16_t tps_getVoltageLimitMV() {
+  uint8_t  vref_l  = _tps_read(TPS_REG_VREF_L);
+  uint8_t  vref_h  = _tps_read(TPS_REG_VREF_H);
+  uint8_t  vout_fs = _tps_read(TPS_REG_VOUT_FS);
+  static const float ratios[] = { 0.2256f, 0.1128f, 0.0752f, 0.0564f };
+  uint16_t ref_code = (((uint16_t)(vref_h & 0x03)) << 8) | vref_l;
+  float    ref_v    = 0.045f + (float)ref_code * 0.001129f;
+  float    v_lim    = ref_v / ratios[vout_fs & 0x03];
+  return (uint16_t)(v_lim * 1000.0f);
+}
+
 // Enable or disable the regulated TEC output rail. Read-modify-write
 // on REG_MODE so we don't disturb the other mode bits.
 inline void tps_setOutput(bool on) {
