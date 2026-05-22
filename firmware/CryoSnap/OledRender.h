@@ -98,6 +98,7 @@ inline void oled_render() {
     case FAULT_TPS_PG:    oled_print_P(F("TPS"));      break;
     case FAULT_HUSB_20V:  oled_print_P(F("PD"));       break;
     case FAULT_FAN_TACH:  oled_print_P(F("FAN"));      break;
+    case FAULT_NO_SUPPLY: oled_print_P(F("NoPSU"));    break;
     default:              oled_print((int)g_fault);    break;
   }
   oled_print_P(F(" H:"));

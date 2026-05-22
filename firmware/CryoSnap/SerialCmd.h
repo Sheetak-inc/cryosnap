@@ -129,6 +129,7 @@ inline void serial_print_status() {
     case FAULT_TPS_PG:    Serial.print(F("TPS"));      break;
     case FAULT_HUSB_20V:  Serial.print(F("PD"));       break;
     case FAULT_FAN_TACH:  Serial.print(F("FAN"));      break;
+    case FAULT_NO_SUPPLY: Serial.print(F("NoPSU"));    break;
     default:              Serial.print(g_fault);       break;
   }
   Serial.print(F(" Mode:"));
