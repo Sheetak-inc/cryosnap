@@ -128,6 +128,21 @@ inline void tps_setCurrentLimit(uint16_t mA) {
   _tps_write(TPS_REG_IOUT_LIMIT, 0x80 | (steps & 0x7F));
 }
 
+// Cheap ACK probe — true if the chip is alive on the I2C bus.
+// The TPS55288 stops responding when its Vin browns out (the chip's
+// internal LDO can't sustain the I2C interface below UVLO), so a
+// NACK from this probe distinguishes "TPS lost its supply" from
+// "supply is insufficient to hold the commanded V_limit" — two
+// failure modes that look identical when reading registers because
+// Wire.read() returns 0 on a non-responding device. The supply
+// check in task_100ms uses this to skip the V_limit comparison
+// (which would otherwise false-trigger FAULT_NO_SUPPLY) when the
+// chip itself has dropped off the bus.
+inline bool tps_isPresent() {
+  Wire.beginTransmission(I2C_ADDR_TPS55288);
+  return (Wire.endTransmission() == 0);
+}
+
 // Read the *currently active* output voltage limit back from the chip,
 // in millivolts. Reconstructed from VREF_L / VREF_H (10-bit reference
 // code) and VOUT_FS (range select) using the same math as
@@ -139,6 +154,12 @@ inline void tps_setCurrentLimit(uint16_t mA) {
 // brief OE pulse is the firmware's only reliable signal that the
 // upstream supply (USB-PD or direct Vin) is actually adequate for
 // 12 V TEC drive.
+//
+// IMPORTANT: this function blindly reads registers; if the chip is
+// not on the bus, every read returns 0 and the decoded value is
+// ~200 mV (well below SUPPLY_VLIM_FLOOR). Callers that care about
+// the difference between "chip is alive but Vlim is 5 V" and
+// "chip is gone" must gate this call on tps_isPresent() above.
 inline uint16_t tps_getVoltageLimitMV() {
   uint8_t  vref_l  = _tps_read(TPS_REG_VREF_L);
   uint8_t  vref_h  = _tps_read(TPS_REG_VREF_H);

@@ -166,11 +166,18 @@ static bool _husb_was_attached = false;
 // Supply-sufficiency check state — used by the periodic V_limit
 // readback in task_100ms. See the long comment near the check
 // itself for the rationale; declared up here so _pd_reinit() can
-// reset both on every enable rising edge.
+// reset everything on every enable rising edge.
 #define SUPPLY_VLIM_FLOOR    5500  // mV — V_limit at or below this after a drive attempt = chip auto-reset
 #define SUPPLY_FAULT_DEBOUNCE   2  // bad reads anywhere in the drive session before latching
 static uint8_t _supply_fault_count    = 0;
 static bool    _tried_drive_last_tick = false;
+// Edge-trigger for "TPS dropped off I2C" — distinct failure mode
+// from "TPS is alive but supply is insufficient." Set false the
+// first tick tps_isPresent() returns false during a drive session;
+// re-armed when the chip comes back or _pd_reinit() runs. Keeps the
+// DIAG message and recovery attempt one-shot per disappearance
+// event instead of spamming once per tick.
+static bool    _tps_was_present       = true;
 
 // ---- button debounce state ----------------------------------------------
 
@@ -228,6 +235,21 @@ static void _pd_reinit();
 // lost its settings during a PD brownout.
 // =========================================================================
 
+// Lightweight TPS-only recovery — safe to call from inside the 100 ms
+// task. Resets the supply-check state and re-runs tps_init() (a few
+// I2C writes, no blocking delays). Crucially, does NOT touch HUSB
+// state: that stays under the explicit enable-cycle path so a
+// concurrent PD drop is not silently swallowed. Caller manages the
+// `_tps_was_present` edge flag.
+static void _tps_only_recover() {
+  tps_init();
+  _supply_fault_count    = 0;
+  _tried_drive_last_tick = false;
+  // Also clear the PD-budget clamp — tps_init() reset the chip's V/I
+  // registers, so any clamp the firmware had asserted is stale.
+  g_pd_clamped           = false;
+}
+
 static void _pd_reinit() {
 #if HAS_HUSB238
   if (husb_negotiatedV() < 20) {
@@ -250,7 +272,7 @@ static void _pd_reinit() {
 #endif
   }
 #endif
-  tps_init();
+  _tps_only_recover();         // tps_init + supply-state reset + g_pd_clamped clear
   _husb_fault_count = 0;
   // Re-arm the sticky "PD ever attached" detector. If the operator
   // is re-enabling after a PD fault (cable knocked loose, source
@@ -259,11 +281,9 @@ static void _pd_reinit() {
   // "was attached" verdict — which would otherwise re-fault on the
   // next tick if PD is genuinely gone now.
   _husb_was_attached = false;
-  // Fresh start for the periodic Vlim-readback supply check. tps_init
-  // above leaves Vlim at the safe 5 V default, so we need to wait
-  // for at least one real drive attempt before judging.
-  _supply_fault_count    = 0;
-  _tried_drive_last_tick = false;
+  // Re-arm the "TPS dropped off I2C" edge trigger. The next
+  // disappearance event re-prints DIAG and re-attempts recovery.
+  _tps_was_present   = true;
 }
 
 // =========================================================================
@@ -345,6 +365,11 @@ void setup() {
   Serial.println(F(" PROTO"));
 #elif BUILD_TARGET == TARGET_REVB
   Serial.println(F(" REVB"));
+  // H-bridge polarity on Rev B is currently inherited from Rev A
+  // without bench verification — see HBridge.h. Print a loud
+  // warning at boot so the operator notices before they trust
+  // cooling commands on an un-validated board.
+  Serial.println(F("WARN: REVB H-bridge polarity is unverified. Confirm cool/heat direction before relying on this build."));
 #else
   Serial.println(F(" REVA"));
 #endif
@@ -635,19 +660,50 @@ static void task_100ms() {
   // regardless of supply, so the "reset to 5 V" signal is moot.
 #if ENABLE_SAFETY_FAULTS
   if (_tried_drive_last_tick && g_vmax_mV > SUPPLY_VLIM_FLOOR) {
-    if (tps_getVoltageLimitMV() <= SUPPLY_VLIM_FLOOR) {
-      _supply_fault_count++;
+    if (!tps_isPresent()) {
+      // TPS chip dropped off the I2C bus — Vin has likely browned
+      // out below the chip's UVLO threshold. A direct V_limit read
+      // would return 0 mV (Wire.read() on a NACK'd device) and
+      // falsely look like "supply insufficient to hold Vmax,"
+      // which would latch FAULT_NO_SUPPLY for the wrong reason.
+      // Edge-trigger a DIAG message and one recovery attempt per
+      // disappearance event; skip the supply-fault counter so the
+      // existing NOPSU detection stays specific to the "chip is
+      // alive but says Vlim=5 V" case.
+      //
+      // IMPORTANT: use the lightweight _tps_only_recover() rather
+      // than the full _pd_reinit(). _pd_reinit clears
+      // _husb_fault_count and _husb_was_attached, and can block on
+      // husb_init() for up to 2 s — both of which are unsafe from
+      // the 100 ms task. _tps_only_recover keeps HUSB state intact
+      // so a concurrent PD drop is still caught by the regular
+      // FAULT_HUSB_20V chain.
+      if (_tps_was_present) {
+        Serial.println(F("DIAG: TPS not on I2C -- attempting reinit"));
+        _tps_only_recover();
+        _tps_was_present = false;  // suppress re-fire until chip recovers
+      }
+    } else {
+      // Chip is alive — re-arm the edge so a future disappearance
+      // triggers a fresh DIAG + recovery, then check V_limit.
+      _tps_was_present = true;
+      if (tps_getVoltageLimitMV() <= SUPPLY_VLIM_FLOOR) {
+        _supply_fault_count++;
+      }
+      // No reset on a good read while we're driving: the TPS oscillates
+      // briefly between "trying to drive at Vmax" and "protected at 5 V"
+      // because the firmware re-writes V_limit every tick. A symmetric
+      // debounce would never trip — we'd alternate 5 V / 12 V / 5 V /
+      // 12 V. Sticky accumulation guarantees that any two bad reads
+      // during the drive session (consecutive or not) latch the fault.
     }
-    // No reset on a good read while we're driving: the TPS oscillates
-    // briefly between "trying to drive at Vmax" and "protected at 5 V"
-    // because the firmware re-writes V_limit every tick. A symmetric
-    // debounce would never trip — we'd alternate 5 V / 12 V / 5 V /
-    // 12 V. Sticky accumulation guarantees that any two bad reads
-    // during the drive session (consecutive or not) latch the fault.
   } else {
     // Not driving — chip's V_limit reading is meaningless. Reset so a
-    // fresh enable starts the assessment from zero.
+    // fresh enable starts the assessment from zero. Also re-arm the
+    // TPS-present edge: when drive resumes we want a fresh DIAG if
+    // the chip is absent at that time.
     _supply_fault_count = 0;
+    _tps_was_present    = true;
   }
 #endif
 

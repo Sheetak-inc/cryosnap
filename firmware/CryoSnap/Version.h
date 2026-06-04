@@ -4,11 +4,45 @@
 // Firmware version — update on each meaningful change.
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  5
-#define FW_VERSION_STR    "0.7.5"
+#define FW_VERSION_PATCH  6
+#define FW_VERSION_STR    "0.7.6"
 
 /*
   Changelog (newest first):
+
+  0.7.6  2026-06-03  Fix TEC direction on Rev A + TPS-lost recovery
+    - BUG-000: H-bridge direction was inverted on TARGET_REVA. The
+      previous comment claimed Rev A wiring used LOW=Cool / HIGH=Heat
+      and a bench audit on Rev A silicon confirmed the opposite —
+      commanding HB_COOL was actively heating the cold plate. Both
+      the PID and the bang-bang controllers were affected across all
+      three Modes (Cool / Heat / Auto) because they all map drive
+      direction through the same HB_COOL / HB_HEAT symbols. Fixed by
+      aligning Rev A polarity with the prototype's
+      HB_COOL=HIGH / HB_HEAT=LOW. TARGET_REVB inherits the same
+      polarity but the inheritance is explicitly unverified — the
+      build emits a #warning at compile time and a boot-time WARN
+      banner under TARGET_REVB so the operator notices before
+      trusting cooling commands on Rev B silicon.
+    - BUG-003: FAULT_NO_SUPPLY was firing spuriously when the
+      TPS55288 dropped off the I2C bus (Vin brownout during
+      high-current cycling). _tps_read returns 0 on a NACK'd
+      device, so tps_getVoltageLimitMV() decoded ~200 mV — below
+      SUPPLY_VLIM_FLOOR — and accumulated the supply counter
+      toward FAULT_NO_SUPPLY for the wrong reason. New
+      tps_isPresent() helper (cheap ACK probe) gates the V_limit
+      read. When the chip is absent during a drive session, the
+      firmware logs `DIAG: TPS not on I2C -- attempting reinit`
+      and runs a lightweight `_tps_only_recover()` (tps_init plus
+      supply-state reset; deliberately does NOT touch HUSB fault
+      tracking or call husb_init's 2 s blocking path, so the
+      concurrent PD-drop fault stays armed and the 100 ms task
+      budget is preserved). The TPS-present edge is re-armed when
+      the chip comes back, when the firmware stops driving, or on
+      the next enable cycle, so a future disappearance triggers a
+      fresh DIAG + recovery. `g_pd_clamped` also clears as part of
+      recovery since `tps_init()` resets the chip's V/I registers
+      and any clamp the firmware had asserted is stale.
 
   0.7.5  2026-05-22  Sticky supply-fault counter — catches oscillating chip
     - The 0.7.4 supply-sufficiency check (periodic V_limit re-read
