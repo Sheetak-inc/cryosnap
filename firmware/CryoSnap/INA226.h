@@ -75,8 +75,14 @@
 static const float    _INA_CURRENT_LSB = 0.0005f;    // 500 uA per bit
 static const float    _INA_POWER_LSB   = 0.0125f;    // 12.5 mW per bit (= 25 × current_LSB)
 static const float    _INA_BUS_LSB     = 0.00125f;   // 1.25 mV per bit (chip-fixed)
+// Round before the cast. Without the + 0.5f, the float evaluates to
+// 1023.9998 at INA_RSENSE = 10 mOhm and truncates to 1023 (0x3FF)
+// instead of the correct 1024 (0x400). The bias is small (~0.1%)
+// but feeds every current/power reading, the PD budget decision,
+// and the supply-fault detection floor — systematic error in all
+// downstream protection. (BUG-005 / CAL in the 2026-06-03 audit.)
 static const uint16_t _INA_CAL_VALUE   =
-    (uint16_t)(0.00512f / (_INA_CURRENT_LSB * INA_RSENSE));
+    (uint16_t)(0.00512f / (_INA_CURRENT_LSB * INA_RSENSE) + 0.5f);
 
 // Maximum measurable current with the current shunt resistor.
 // The INA226 SHUNT_V register clips at ±81.92 mV (±32767 × 2.5 uV).

@@ -283,6 +283,8 @@ static void _pd_reinit() {
   _husb_was_attached = false;
   // Re-arm the "TPS dropped off I2C" edge trigger. The next
   // disappearance event re-prints DIAG and re-attempts recovery.
+  // (_supply_fault_count, _tried_drive_last_tick, g_pd_clamped
+  //  are already reset by _tps_only_recover() above.)
   _tps_was_present   = true;
 }
 
@@ -658,8 +660,25 @@ static void task_100ms() {
   // Skip entirely when the user has configured Vmax at or below
   // the floor; in that range the chip will hold the request
   // regardless of supply, so the "reset to 5 V" signal is moot.
+  //
+  // Also skip while the PD-budget clamp is latched: the clamp
+  // writes its own reduced V_limit (often below 5500 mV when the
+  // supply rail had drooped at trip), and reading that back would
+  // false-trigger NOPSU within ~SUPPLY_FAULT_DEBOUNCE ticks of
+  // the clamp firing. The reduced V_limit during clamp is the
+  // firmware's deliberate choice, not a chip-side protection.
 #if ENABLE_SAFETY_FAULTS
-  if (_tried_drive_last_tick && g_vmax_mV > SUPPLY_VLIM_FLOOR) {
+  // Three exclusions before we even read V_limit back:
+  //   - not driving last tick: chip's V_limit is whatever it was
+  //     last commanded, not a fresh probe response
+  //   - g_vmax_mV <= floor: operator asked for ~5 V which is below
+  //     the detection threshold anyway
+  //   - g_pd_clamped: the latching PD clamp writes its own reduced
+  //     V_limit which can land below the floor when the supply rail
+  //     drooped at trip time. Reading that back would false-trigger
+  //     FAULT_NO_SUPPLY for the wrong reason. (BUG-004 ↔ NOPSU
+  //     interaction caught by the PR-A adversarial review.)
+  if (_tried_drive_last_tick && g_vmax_mV > SUPPLY_VLIM_FLOOR && !g_pd_clamped) {
     if (!tps_isPresent()) {
       // TPS chip dropped off the I2C bus — Vin has likely browned
       // out below the chip's UVLO threshold. A direct V_limit read
@@ -668,8 +687,8 @@ static void task_100ms() {
       // which would latch FAULT_NO_SUPPLY for the wrong reason.
       // Edge-trigger a DIAG message and one recovery attempt per
       // disappearance event; skip the supply-fault counter so the
-      // existing NOPSU detection stays specific to the "chip is
-      // alive but says Vlim=5 V" case.
+      // NOPSU detection stays specific to the "chip is alive but
+      // says Vlim=5 V" case.
       //
       // IMPORTANT: use the lightweight _tps_only_recover() rather
       // than the full _pd_reinit(). _pd_reinit clears
@@ -698,10 +717,11 @@ static void task_100ms() {
       // during the drive session (consecutive or not) latch the fault.
     }
   } else {
-    // Not driving — chip's V_limit reading is meaningless. Reset so a
-    // fresh enable starts the assessment from zero. Also re-arm the
-    // TPS-present edge: when drive resumes we want a fresh DIAG if
-    // the chip is absent at that time.
+    // Not driving (or clamp latched, or operator dropped Vmax to the
+    // floor) — chip's V_limit reading is meaningless for the supply
+    // check. Reset so a fresh enable starts the assessment from
+    // zero. Also re-arm the TPS-present edge so a future
+    // disappearance during real drive fires a fresh DIAG.
     _supply_fault_count = 0;
     _tps_was_present    = true;
   }
@@ -748,11 +768,14 @@ static void task_100ms() {
     }
 #endif
 
-    // (c) TPS55288 health is monitored via the I2C STATUS register
-    //     in task_diag() rather than a discrete fault pin — the chip
-    //     handles its own catastrophic shutdowns and current-limit
-    //     during normal TEC drive looks identical to a fault on the
-    //     PG line, which makes the discrete pin worse than useless.
+    // (c) TPS55288 SCP is monitored via the I2C STATUS register
+    //     earlier in this same task (section 3b above) rather than
+    //     a discrete fault pin — the chip handles its own
+    //     catastrophic shutdowns and current-limit during normal
+    //     TEC drive looks identical to a fault on the PG line,
+    //     which makes the discrete pin worse than useless. A
+    //     latched SCP shows up as FAULT_TPS_PG in the rest of the
+    //     fault chain even though it isn't latched here.
 
     // (d) HUSB238 lost 20V PD contract for HUSB_FAULT_DEBOUNCE ticks.
 #if HAS_HUSB238
@@ -814,27 +837,40 @@ static void task_100ms() {
   }
 
   // ---- 3. PD POWER-BUDGET CLAMP ----------------------------------------
+  // When measured power crosses the PD budget, write reduced V/I
+  // limits and LATCH the clamp until the next enable cycle. The
+  // latch prevents the off/on oscillation the previous design had:
+  // the old code cleared g_pd_clamped as soon as power dipped
+  // below budget, which let the actuate block re-write the full
+  // drive_mA / g_vmax_mV on the next tick, which pushed power
+  // back over budget, which re-fired the clamp. Up to ~10 Hz
+  // toggling under the prior design; bench evidence in the
+  // 2026-06-03 audit (BUG-004 / C-1).
+  //
+  // The actuate block in section 5 now respects g_pd_clamped and
+  // skips its V/I writes so the reduced limits stick. The clamp
+  // releases when the operator re-enables (see _pd_reinit()).
 #if HAS_INA226 && ENABLE_PD_BUDGET_CLAMP
-  if (g_pd_budget_mW > 0) {
+  // Also gate on g_enabled so a noisy INA reading during the
+  // disabled window can't spuriously latch the clamp. Released
+  // automatically on the next _pd_reinit either way.
+  if (g_enabled && g_pd_budget_mW > 0 && !g_pd_clamped) {
     float power_mW = ina_p_ceiling * 1000.0f;
     if (power_mW >= (float)g_pd_budget_mW) {
-      if (!g_pd_clamped) {
-        uint16_t clamp_mV = (uint16_t)(ina_v * 1000.0f);
-        uint16_t clamp_mA = (uint16_t)(ina_i * 1000.0f);
-        tps_setVoltageLimit(clamp_mV);
-        tps_setCurrentLimit(clamp_mA);
-        g_pd_clamped = true;
-        Serial.print(F("PD CLAMP: "));
-        Serial.print(clamp_mV); Serial.print(F(" mV / "));
-        Serial.print(clamp_mA); Serial.println(F(" mA"));
-      }
-    } else {
-      g_pd_clamped = false;
+      uint16_t clamp_mV = (uint16_t)(ina_v * 1000.0f);
+      uint16_t clamp_mA = (uint16_t)(ina_i * 1000.0f);
+      tps_setVoltageLimit(clamp_mV);
+      tps_setCurrentLimit(clamp_mA);
+      g_pd_clamped = true;
+      Serial.print(F("PD CLAMP: "));
+      Serial.print(clamp_mV); Serial.print(F(" mV / "));
+      Serial.print(clamp_mA); Serial.println(F(" mA"));
+      Serial.println(F("  clamp latched until re-enable"));
     }
   }
 #endif
 
-#if ENABLE_DIAGNOSTICS
+#if ENABLE_SAFETY_FAULTS
   // ---- 3b. FAST TPS STATUS POLL (SCP detection) ------------------------
   // Poll the TPS STATUS register at the 100 ms task cadence so a
   // short-circuit event surfaces promptly. The bit is latched in
@@ -848,14 +884,25 @@ static void task_100ms() {
   // short persists, naively re-enabling would just trigger SCP
   // again forever. The operator clears the latch explicitly via
   // the enable button or `enable 1`.
+  //
+  // Gated on ENABLE_SAFETY_FAULTS — NOT ENABLE_DIAGNOSTICS — because
+  // this is a safety latch, not advisory logging. A build that turns
+  // diagnostics off to reclaim flash must still get short-circuit
+  // protection. (BUG-001 / S-2 in the 2026-06-03 audit log.)
+  //
+  // The latch fires only when no other fault is currently active —
+  // if OVERTEMP or INA-alert latched earlier in this tick, leave
+  // the original cause in g_fault for the operator. _scp_last still
+  // updates unconditionally so the chip-level latch state stays
+  // tracked across ticks.
   {
     static bool _scp_last = false;
     uint8_t status = _tps_read(TPS_REG_STATUS);
     bool scp = (status & 0x80) != 0;       // bit 7 = SCP
-    if (scp && !_scp_last) {
+    if (scp && !_scp_last && g_fault == FAULT_NONE) {
       g_enabled = false;
       g_fault   = FAULT_TPS_PG;
-      Serial.println(F("DIAG: TPS reports SCP -- check TEC or circuit for short"));
+      Serial.println(F("FAULT[SCP]: TPS reports short -- check TEC or wiring"));
       serial_print_status();
     }
     _scp_last = scp;
@@ -944,10 +991,21 @@ static void task_100ms() {
   }
 
   // ---- 5. ACTUATE -------------------------------------------------------
+  //
+  // Under PD-budget clamp (g_pd_clamped == true), keep OE on but
+  // do NOT overwrite the V/I limits — the clamp block above wrote
+  // reduced values and we want them to stick. Previously this
+  // block always re-wrote the full drive_mA / g_vmax_mV, which
+  // defeated the clamp entirely (BUG-004 / C-1 in the 2026-06-03
+  // audit log). hb_safeDirectionChange still runs because a
+  // direction flip under clamp is still safer with the standard
+  // sequence (TPS off -> settle -> toggle -> TPS on).
 
-  if (tec_on && !g_pd_clamped) {
-    tps_setCurrentLimit(drive_mA);
-    tps_setVoltageLimit(g_vmax_mV);
+  if (tec_on) {
+    if (!g_pd_clamped) {
+      tps_setCurrentLimit(drive_mA);
+      tps_setVoltageLimit(g_vmax_mV);
+    }
     hb_safeDirectionChange(drive_dir);
     tps_setOutput(true);
     _tried_drive_last_tick = true;   // arm the supply-Vlim check for next tick

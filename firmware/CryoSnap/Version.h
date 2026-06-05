@@ -4,8 +4,8 @@
 // Firmware version — update on each meaningful change.
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  6
-#define FW_VERSION_STR    "0.7.6"
+#define FW_VERSION_PATCH  7
+#define FW_VERSION_STR    "0.7.7"
 
 /*
   Changelog (newest first):
@@ -43,6 +43,65 @@
       fresh DIAG + recovery. `g_pd_clamped` also clears as part of
       recovery since `tps_init()` resets the chip's V/I registers
       and any clamp the firmware had asserted is stale.
+  0.7.7  2026-06-05  Audit-quick-wins: SCP gate, PD clamp, truncation, input clamps
+
+    - BUG-001 / S-2: the FAULT_TPS_PG short-circuit latch was wrapped
+      in `#if ENABLE_DIAGNOSTICS`. Diagnostics is advisory-only and
+      MINIMAL_BUILD turns it off to reclaim flash, which silently
+      removed a safety latch. Re-gated under ENABLE_SAFETY_FAULTS
+      so any build with safety faults on now has SCP protection.
+      Also tightened the SCP block: added `g_fault == FAULT_NONE`
+      guard so an earlier fault (e.g. OVERTEMP) keeps its trip
+      cause, and renamed the operator message from `DIAG:` to
+      `FAULT[SCP]:` to match other latching faults.
+      Behavior loss: a build with `ENABLE_DIAGNOSTICS=1` +
+      `ENABLE_SAFETY_FAULTS=0` no longer gets the advisory SCP
+      print either. Accept this for now — in practice safety
+      faults are on for any build that cares about the SCP
+      signal.
+
+    - BUG-004 / C-1: the PD power-budget clamp was producing an
+      off/on oscillation at up to ~10 Hz under sustained load. Old
+      code wrote reduced V/I limits when over budget, then the
+      actuate stage turned OE off entirely (gated on
+      !g_pd_clamped); INA then read 0 W, the clamp cleared, the
+      actuate stage re-wrote full drive_mA, power spiked, the clamp
+      re-fired, repeat. Two changes: (a) actuate now keeps OE on
+      under clamp but skips its V/I writes so the reduced limits
+      stick; (b) the clamp latches — it no longer auto-clears when
+      power dips, the operator releases it via the next enable
+      cycle. `_pd_reinit()` clears `g_pd_clamped` so re-enable
+      restores full drive. The clamp section also now gates on
+      g_enabled so a noisy INA reading during the disabled window
+      can't spuriously latch.
+      Interaction fix: the supply-Vlim NOPSU check (added in
+      0.7.5) reads the chip's V_limit register back and trips
+      FAULT_NO_SUPPLY when it drops below 5500 mV. The PD clamp
+      writes its own reduced V_limit which can land below that
+      floor if the supply rail had drooped at trip — that would
+      false-trip NOPSU within a few ticks of the clamp latching.
+      Added `&& !g_pd_clamped` to the NOPSU check condition so
+      the clamp's deliberate low V_limit doesn't get mistaken for
+      the chip's auto-reset signal.
+
+    - BUG-005 / CAL + PID-5: float-to-uint truncation in two
+      places. (a) INA226 `_INA_CAL_VALUE` evaluated to 1023.9998
+      and truncated to 1023 (0x3FF) instead of the correct
+      1024 (0x400) — every current/power reading biased low by
+      ~0.1%, feeding into the PD budget decision and the supply
+      fault floor. (b) `tps_setCurrentLimit()` encoded
+      `steps = (uint8_t)(v_sense / 0.0005f)` without rounding —
+      40 mA truncated to 0 steps (full sub-50 mA dead zone), and
+      2000 mA truncated to 39 steps = 1950 mA delivered. Added
+      + 0.5f in both spots so the cast rounds to the nearest
+      valid step.
+
+    - BUG-009 / C-2: `imax <mA>` and `vmax <mV>` used `atoi()`
+      (16-bit int on AVR) then a bare `(uint16_t)` cast. Bench
+      evidence: `imax 70000` → echoed 4464 mA (the wrap of
+      70000 mod 65536). Switched to `atol()` and clamped to the
+      TPS-encodable ceilings (6350 mA / 20000 mV) before the
+      cast, so over-range entries saturate instead of wrapping.
 
   0.7.5  2026-05-22  Sticky supply-fault counter — catches oscillating chip
     - The 0.7.4 supply-sufficiency check (periodic V_limit re-read
