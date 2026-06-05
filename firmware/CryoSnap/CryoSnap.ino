@@ -205,6 +205,43 @@ static unsigned long _enable_time = 0;
 static uint32_t g_pd_budget_mW = 0;
 static bool     g_pd_clamped   = false;
 
+// ---- PID dt tracking ----------------------------------------------------
+// Wall-clock timestamp of the previous pid_compute() / deadband-observe
+// tick. Used by the task_100ms PID branch to derive actual elapsed dt
+// instead of trusting LOOP_INTERVAL_MS (BUG-008 fix).
+//
+// File-static (not inside the PID branch) so it can be reset alongside
+// pid_reset() — if pid_compute hasn't run for a while (disable cycle,
+// fault, prolonged deadband stay), the next call would otherwise see
+// a multi-second raw delta that the [0.05, 0.5] s dt clamp saturates
+// to 0.5 s, producing a 5x oversized first integrator step.
+// Sentinel 0 means "no prior tick, use the LOOP_INTERVAL_MS nominal."
+static unsigned long _pid_last_ms = 0;
+
+// Wrap pid_reset() so we also re-arm the dt sentinel — every site that
+// clears PID state should also clear the dt history so the next compute
+// starts with a fresh, sane dt.
+static inline void _pid_full_reset() {
+  pid_reset();
+  _pid_last_ms = 0;
+}
+
+// Mode-change helper. With the new conditional-integration in 0.7.8,
+// a non-zero integrator accumulated under one Mode's [out_min, out_max]
+// bounds does NOT get drained when the operator switches Modes — it
+// just unwinds at err*dt per tick. For the typical bench scenarios
+// (~1000 mA·s residual + 10 °C step) this can take a minute or more
+// to release, defeating the BUG-002 anti-windup story for cross-mode
+// transitions. So: any mode change drops the integrator. The change-
+// detection guard avoids resetting every 50 ms when the analog mode
+// switch pot sits steady on one threshold.
+static inline void _set_mode(uint8_t new_mode) {
+  if (new_mode != g_mode) {
+    g_mode = new_mode;
+    _pid_full_reset();
+  }
+}
+
 // =========================================================================
 // forward declarations for the scheduled tasks
 // =========================================================================
@@ -537,7 +574,7 @@ void loop() {
             if (g_enabled) {
               _enable_time = millis();  // start grace period
               _pd_reinit();            // re-negotiate PD if needed
-              pid_reset();             // clear stale integral/derivative
+              _pid_full_reset();       // clear stale integral + derivative + dt history
               ctrl_on_enable();        // kick off armed schedule, if any
             }
             Serial.print(F("Enable: "));
@@ -547,12 +584,15 @@ void loop() {
       }
     }
 
-    // Mode switch (A6 analog).
+    // Mode switch (A6 analog). Wrapped in _set_mode() so an actual
+    // mode change drains the PID integrator (see BUG-002 follow-up
+    // in 0.7.8 changelog).
     {
       uint16_t mode_raw = analogRead(HW_MODE_SWITCH);
-      if      (mode_raw < MODE_THRESH_COOL) g_mode = MODE_COOL;
-      else if (mode_raw < MODE_THRESH_AUTO) g_mode = MODE_AUTO;
-      else                                  g_mode = MODE_HEAT;
+      uint8_t  new_mode = (mode_raw < MODE_THRESH_COOL) ? MODE_COOL
+                       : (mode_raw < MODE_THRESH_AUTO) ? MODE_AUTO
+                                                       : MODE_HEAT;
+      _set_mode(new_mode);
     }
 
     // Pot -> setpoint (A7).
@@ -932,17 +972,63 @@ static void task_100ms() {
     if (abs_err <= g_deadband) {
       // Inside deadband — both controllers agree: TEC off.
       drive_mA = 0;
+      // Keep the PID derivative-on-measurement history fresh
+      // even though we skipped pid_compute() — otherwise leaving
+      // the deadband would see a stale _pid_last_measured and
+      // produce a one-tick spike proportional to drift. (BUG-007
+      // fix is only useful if observe-while-deadband is wired.)
+      pid_observe(t_cold);
+      // Also advance the dt timestamp so the first compute after
+      // a multi-tick deadband stay sees one nominal tick of dt,
+      // not the full deadband duration clamped to 0.5 s. Without
+      // this the integrator would absorb up to 5x its usual step
+      // on the deadband-exit tick.
+      _pid_last_ms = millis();
     }
     else if (g_use_pid) {
       // ---- PID controller ----
       // pid_compute uses the convention error = setpoint - measured
       // → output > 0 means HEAT, output < 0 means COOL.
-      const float dt = LOOP_INTERVAL_MS / 1000.0f;
-      float out = pid_compute(g_setpoint, t_cold, dt, (float)g_imax_mA);
+      //
+      // dt is measured per-tick (BUG-008): cooperative scheduling
+      // means real ticks stretch past LOOP_INTERVAL_MS when other
+      // work runs long (~100 ms fan tach poll on the slow task,
+      // hb_safeDirectionChange's 5 ms wait, long fault dumps).
+      // Stretched ticks would under-integrate and over-differentiate
+      // against a fixed dt = 0.1. _pid_last_ms is file-static so
+      // _pid_full_reset() clears it alongside the integrator —
+      // post-disable, post-deadband, post-fault recovery all start
+      // with a fresh dt sentinel rather than a stale wall-clock
+      // delta.
+      //
+      // out_min / out_max express the Mode constraint to
+      // pid_compute, so the controller itself knows which
+      // direction it can drive (BUG-002): integration is frozen
+      // the moment the proposed total output would push past
+      // the forbidden bound, leaving no residual that would
+      // delay the correct direction once the actuator is free
+      // again.
+      unsigned long now = millis();
+      // _pid_last_ms == 0 sentinel means "no prior tick" (after
+      // boot, after _pid_full_reset, after entering this branch
+      // for the first time since a deadband/disabled stretch).
+      // Fall back to the nominal LOOP_INTERVAL_MS in that case.
+      float dt = (_pid_last_ms == 0) ? (LOOP_INTERVAL_MS / 1000.0f)
+                                     : (float)(now - _pid_last_ms) / 1000.0f;
+      _pid_last_ms = now;
+      // Sane bounds against occasional scheduler stall or a long
+      // fault dump — the first-call fallback above already protects
+      // the initial tick separately.
+      if (dt < 0.05f) dt = 0.05f;
+      if (dt > 0.5f)  dt = 0.5f;
 
-      // Apply Mode constraint — clamp away the disallowed direction.
-      if      (g_mode == MODE_COOL && out > 0) out = 0;
-      else if (g_mode == MODE_HEAT && out < 0) out = 0;
+      float out_min, out_max;
+      switch (g_mode) {
+        case MODE_COOL: out_min = -(float)g_imax_mA; out_max = 0.0f;            break;
+        case MODE_HEAT: out_min = 0.0f;              out_max = (float)g_imax_mA; break;
+        default:        out_min = -(float)g_imax_mA; out_max = (float)g_imax_mA; break;  // AUTO
+      }
+      float out = pid_compute(g_setpoint, t_cold, dt, out_min, out_max);
 
       if (out > 0.5f) {
         drive_dir = HB_HEAT;

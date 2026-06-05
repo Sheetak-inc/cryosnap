@@ -257,7 +257,7 @@ static void _cmd_execute(char* cmd) {
     if (g_enabled) {
       _enable_time = millis();
       _pd_reinit();
-      pid_reset();              // clear any stale integrator
+      _pid_full_reset();        // clear stale integral + derivative + dt history
       ctrl_on_enable();         // kick off armed schedule, if any
     }
     Serial.print(F("Enable:")); Serial.println(g_enabled ? '1' : '0');
@@ -314,7 +314,7 @@ static void _cmd_execute(char* cmd) {
   else if (MATCH("mode", 4)) {
     if (_has_arg(cmd + 4)) {
       int v = atoi(cmd + 4);
-      if (v >= 0 && v <= 2) g_mode = (uint8_t)v;
+      if (v >= 0 && v <= 2) _set_mode((uint8_t)v);
     }
     Serial.print(F("Mode:"));
     Serial.println(g_mode == MODE_COOL ? F("Cool") :
@@ -388,7 +388,7 @@ static void _cmd_execute(char* cmd) {
     } else {
       g_use_pid = !g_use_pid;
     }
-    pid_reset();   // both directions of toggle benefit from a clean integrator
+    _pid_full_reset();   // both directions of toggle benefit from a clean integrator + dt history
     Serial.print(F("PID:")); Serial.println(g_use_pid ? '1' : '0');
   }
   else if (MATCH("kp", 2)) {

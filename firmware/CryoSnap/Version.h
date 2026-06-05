@@ -4,11 +4,93 @@
 // Firmware version — update on each meaningful change.
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  7
-#define FW_VERSION_STR    "0.7.7"
+#define FW_VERSION_PATCH  8
+#define FW_VERSION_STR    "0.7.8"
 
 /*
   Changelog (newest first):
+
+  0.7.8  2026-06-05  PID rework — conditional integration, deriv-on-measurement, real dt
+
+    Closes five PID-related items from the 2026-06-03 audit log
+    in one coherent refactor of PID.h plus the task_100ms caller.
+
+    - BUG-002 / PID-1 (high): the integrator wound up in the
+      mode-forbidden direction. Cool mode + temp below setpoint
+      meant the PID "wanted to heat"; caller post-clamped that
+      output to 0 but the integrator kept growing. Bench-measured
+      383x delay (118 s vs 0.31 s baseline) in the audit.
+      pid_compute() now takes [out_min, out_max] bounds expressing
+      the Mode constraint and freezes integration the moment the
+      proposed total output would push past the forbidden bound.
+      No residual builds in a direction the actuator can't use.
+
+    - BUG-006 / PID-2 (medium): old anti-windup was a fixed clamp
+      at +/-out_max/Ki, which let the integral grow up to its own
+      clamp even while the proportional term was already pinning
+      the output at the bound. Long settling tails after big
+      setpoint steps. The new conditional-integration design from
+      BUG-002 fixes this case for free: same anti-windup decision
+      handles both hard PID saturation and direction-forbidden
+      saturation through one check.
+
+    - BUG-007 / PID-3 (medium, latent): derivative was computed
+      on error, which produces a one-tick deriv = err/dt spike
+      whenever the setpoint steps (and whenever pid_reset() runs
+      with a real measurement off setpoint). Masked today because
+      DEFAULT_KD = 0, but anyone raising Kd hit unexplained
+      drive_mA kicks. Switched to derivative-on-measurement
+      (mathematically equivalent for constant sp, free of the
+      kick), plus a _pid_seeded flag that suppresses the
+      derivative on the very first call after reset. New
+      pid_observe(measured) helper called from the deadband
+      branch keeps _pid_last_measured fresh so leaving the
+      deadband doesn't produce a stale-derivative spike either.
+
+    - BUG-008 / PID-4 (medium): task_100ms() passed
+      dt = LOOP_INTERVAL_MS/1000 = 0.1, but real ticks stretch
+      well past that (~100 ms fan tach poll on the slow task,
+      5 ms direction-flip delay, long fault dumps). Ki and Kd
+      effectively drifted with system load. Caller now measures
+      actual elapsed time via millis() and passes it as dt,
+      clamped to [0.05, 0.5] s so pathological scheduler stalls
+      can't produce degenerate math. The first PID tick after
+      boot, after _pid_full_reset, or after a deadband stay
+      falls back to the nominal LOOP_INTERVAL_MS via a separate
+      sentinel branch (no stale wall-clock delta).
+      Follow-up to the adversarial review: _pid_last_ms is
+      hoisted to file-static and cleared inside
+      _pid_full_reset(), so every disable/enable, fault recovery,
+      and `pid` toggle starts with a fresh dt sentinel. The
+      deadband branch also advances _pid_last_ms each tick so
+      leaving a multi-tick deadband stay doesn't see the full
+      stay as one inflated dt.
+
+    - BUG-002 follow-up (adversarial review): mode changes now
+      drain the PID state via a _set_mode() helper at both
+      writer sites (analog mode switch in task_50ms and the
+      `mode` serial command). With conditional integration in
+      place but no mode-change drain, an integrator accumulated
+      under one Mode's bounds would unwind at err*dt per tick
+      after the swap — measured-equivalent to BUG-002's
+      original 100+ s residual delay just triggered by mode
+      toggle instead of by mode-forbidden integration. The
+      _set_mode() helper change-detects so steady analog reads
+      don't keep wiping the integrator every 50 ms.
+
+    - BUG-010 / PID-6 (low, latent): pid_compute had no guard
+      against dt <= 0 or NaN setpoint/measurement. A future
+      caller passing bad inputs would push inf/NaN into the TPS
+      current command. Added early-return-zero on non-finite or
+      non-positive inputs so a bad input can't poison the
+      actuator.
+
+    API change: pid_compute() signature changed from
+      pid_compute(sp, m, dt, out_max)              // symmetric +/-
+    to
+      pid_compute(sp, m, dt, out_min, out_max)     // explicit bounds
+    The only caller is task_100ms in CryoSnap.ino, updated to
+    derive out_min/out_max from g_mode.
 
   0.7.6  2026-06-03  Fix TEC direction on Rev A + TPS-lost recovery
     - BUG-000: H-bridge direction was inverted on TARGET_REVA. The
