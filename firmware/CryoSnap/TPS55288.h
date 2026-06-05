@@ -122,7 +122,12 @@ inline void tps_setCurrentLimit(uint16_t mA) {
   if (v_sense < 0.0f)    v_sense = 0.0f;
   if (v_sense > 0.0635f) v_sense = 0.0635f;            // 127 LSB cap
 
-  uint8_t steps = (uint8_t)(v_sense / 0.0005f);
+  // Round before the cast (+ 0.5f). Without rounding, 40 mA
+  // encoded to 0 steps (full dead-zone, controller can't drive
+  // sub-50 mA currents at all) and 2000 mA encoded to 39 steps
+  // = 1950 mA delivered. Rounding gives the closest valid step.
+  // (BUG-005 / PID-5 in the 2026-06-03 audit log.)
+  uint8_t steps = (uint8_t)(v_sense / 0.0005f + 0.5f);
 
   // Bit 7 enables the hardware current limiter.
   _tps_write(TPS_REG_IOUT_LIMIT, 0x80 | (steps & 0x7F));

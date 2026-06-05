@@ -285,8 +285,14 @@ static void _cmd_execute(char* cmd) {
   }
   else if (MATCH("imax", 4)) {
     if (_has_arg(cmd + 4)) {
-      int v = atoi(cmd + 4);
-      if (v < 0) v = 0;
+      // Clamp BOTH ends before the uint16_t cast. atoi returns int;
+      // a bare cast on out-of-range positives wraps silently —
+      // imax 70000 became 4464 mA in the old code (BUG-009 / C-2
+      // in the 2026-06-03 audit). Upper bound is the TPS55288's
+      // encodable ceiling: 0.0635 V / 10 mOhm shunt = 6350 mA.
+      long v = atol(cmd + 4);
+      if (v < 0)    v = 0;
+      if (v > 6350) v = 6350;
       g_imax_mA = (uint16_t)v;
       tps_setCurrentLimit(g_imax_mA);
     }
@@ -294,8 +300,12 @@ static void _cmd_execute(char* cmd) {
   }
   else if (MATCH("vmax", 4)) {
     if (_has_arg(cmd + 4)) {
-      int v = atoi(cmd + 4);
-      if (v < 0) v = 0;
+      // Same wrap protection as imax. tps_setVoltageLimit also
+      // clamps internally to 20000 mV, but the unclamped value
+      // would still land in g_vmax_mV and persist through save.
+      long v = atol(cmd + 4);
+      if (v < 0)     v = 0;
+      if (v > 20000) v = 20000;
       g_vmax_mV = (uint16_t)v;
       tps_setVoltageLimit(g_vmax_mV);
     }
