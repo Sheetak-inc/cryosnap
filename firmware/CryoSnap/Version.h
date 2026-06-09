@@ -74,18 +74,44 @@
     `ramp_cap_mA` advancing through the SOFT_START_MS window. The
     ramp is mechanically working as designed.
 
-    Efficacy is INCONCLUSIVE at this N. Across 3 paired Phase-4
-    sessions with PD attached:
-      v0.7.9 Run B (no ramp):                2 CDC=0xE0 events
-      v0.7.10 pre-banner-fix (ramp in code): 1 CDC=0xE0 event
-      v0.7.10 banner-fixed (this commit):    2 CDC=0xE0 events
-    Range 1–2 with no clear directionality. The pre-push adversarial
-    review (workflow wf_e9e5d234-632) is right that N≥5 paired runs
-    with controlled ambient + uptime are needed before any "X%
-    reduction" claim. Phase-5 cumulative chip-lockup still fires in
-    all v0.7.10 runs — that lockup is the BUG-003-addendum hardware
-    ceiling (no I2C soft-reset, EN tied to AREF on Rev A; firmware
-    has no PVIN-cycle path).
+    Efficacy validated at N=5 paired sessions on 2026-06-09. Same
+    firmware source, same rig, ~5 minute gap between runs. Soft-start
+    enabled via ENABLE_SOFT_START=1 (default) vs disabled via
+    -DENABLE_SOFT_START=0 compile-time override:
+
+      Phase-4 FAULT[PD] count (the per-enable inrush metric):
+        SS=on:   1, 2, 2, 2, 0   mean 1.4   median 2   range [0,2]
+        SS=off: 15, 7,10, 9, 4   mean 9.0   median 9   range [4,15]
+        Delta:  -7.6 PD events / run (-84% mean, -78% median).
+        All 5 paired runs go same direction; worst SS=on (2) is
+        strictly less than best SS=off (4) — complete separation.
+        Sign test 5/5 → one-tailed p≈0.06.
+
+      Phase-4 CDC=0xE0 (per-toggle test-counter, not the FAULT[PD]
+      grep):
+        SS=on:   1, 2, 2, 2, 0   mean 1.4
+        SS=off:  3, 2, 4, 4, 1   mean 2.8
+        Delta:  -1.4 events / run (-50%).
+
+      Phase-5 NOPSU latch count:
+        SS=on:   3, 3, 3, 3, 3   ← deterministic
+        SS=off:  3, 0, 3, 0, 3   ← bimodal (2/5 runs survived Phase 5)
+        Unexpected: SS=on reaches Phase-5 lockup MORE reliably than
+        SS=off. Hypothesis: SS lets more Phase-4 enables succeed (PD
+        source can sustain them) → more total drive-time → more
+        cumulative chip-side stress before Phase 5; SS=off rejects
+        more enables → less cumulative stress → chip sometimes
+        survives Phase 5. Either way, Phase-5 cumulative chip-lockup
+        is the documented hardware ceiling (no I2C soft-reset, EN
+        tied to AREF on Rev A; firmware has no PVIN-cycle path).
+        Future v0.7.11 work: escalate _tps_only_recover to issue
+        HUSB_CMD_HARD_RESET (defined in HUSB238.h:77, currently
+        never called) as an indirect PVIN cycle on the USB-PD path —
+        the only software-reachable proxy for a true POR.
+
+    Bench logs: ~/testing/logs/nopsu_campaign_v710_r{1..5}_*.log
+    (SS=on) and ~/testing/logs/nopsu_campaign_v710noss_r{1..5}_*.log
+    (SS=off).
 
     Pre-push review (workflow wf_e9e5d234-632): six parallel
     adversarial lenses found 4 majors and 7 minors. Applied here:
