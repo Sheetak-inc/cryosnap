@@ -16,6 +16,14 @@
         there but the converter is off. Usually the bench rocker
         switch or a USB-C cable issue.
     (c) TPS responding, but INA doesn't ACK — current sensing died.
+    (d) TPS responding, but CDC register reverted to power-on
+        default (0xE0 instead of TPS_CDC_OPMODE=0xA0). The chip
+        silently reset its registers — usually a Vin brownout
+        during high-current drive that didn't go far enough to
+        drop the I2C interface. Firmware-side state is now stale.
+        Recover via _tps_only_recover() which re-runs tps_init()
+        and clears the supply-fault counters. BUG-003 addendum
+        Fix 2.
     (e) TPS OE on, but INA reads ~0 A for several ticks — probably
         a disconnected or open TEC.
 
@@ -66,6 +74,22 @@ inline void task_diag() {
   // (c) TPS ok but INA missing.
   if (tps_resp && !ina_resp && (!_tps_resp_last || _ina_resp_last)) {
     Serial.println(F("DIAG: Current sensing INA226 offline"));
+  }
+
+  // (d) TPS ok but CDC reverted to power-on default — the chip
+  // silently reset during a Vin transient and tps_init's CDC write
+  // never re-landed. Without this check, the firmware would happily
+  // command V/I writes that the chip might also drop, eventually
+  // accumulating supply-fault counter increments and tripping NOPSU
+  // for the wrong reason (BUG-003 addendum 2026-06-05). Cheap: one
+  // I2C byte read at 1 s cadence.
+  if (tps_resp) {
+    uint8_t cdc = tps_getCDC();
+    if (tps_lastReadOk() && cdc != TPS_CDC_OPMODE) {
+      // Silent recover — drift is invisible to the operator but
+      // brief; trips surface via NACK counter if recovery fails.
+      _tps_only_recover();
+    }
   }
 
   // (e) TPS driving but no current visible at INA. Debounce for 3

@@ -4,11 +4,400 @@
 // Firmware version — update on each meaningful change.
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  8
-#define FW_VERSION_STR    "0.7.8"
+#define FW_VERSION_PATCH  10
+#define FW_VERSION_STR    "0.7.10"
 
 /*
   Changelog (newest first):
+
+  0.7.10  2026-06-09  Soft-start I_limit ramp at the actuate layer
+
+    Motivation: BUG-003 addendum bench evidence (logs/23.txt) showed
+    enable-edge inrush as a recurring trigger for FAULT[PD] events.
+    Multiple Phase-4 toggles knocked the upstream USB-PD source off
+    for 500 ms each, and the eventual Phase-5 chip-lockup was
+    preceded by repeated brown-outs the PD source could not sustain.
+
+    Mechanism: I_limit linear ramp from SOFT_START_I_MA up to
+    g_imax_mA over SOFT_START_MS at the actuate layer, above PID
+    and bang-bang so both controllers benefit. Three re-arm
+    triggers — operator enable rising edge, _tps_only_recover
+    success leg, and any actuate gap > SOFT_START_RESET_GAP_MS
+    (deadband-exit protection). Configurable via Config.h
+    (ENABLE_SOFT_START, SOFT_START_MS, SOFT_START_I_MA,
+    SOFT_START_RESET_GAP_MS). Disabling (ENABLE_SOFT_START=0)
+    collapses to today's instant-jump writes byte-for-byte.
+
+    Implementation notes:
+    - I_limit only. For a TEC (low-impedance + Seebeck EMF) the
+      V_limit is just a ceiling that never engages during drive;
+      V_limit is written through unmodified.
+    - Monotonic ceiling formula (ramp_cap_mA = SOFT_START_I_MA +
+      proportional climb to g_imax_mA, then `ramp_mA = min(drive_mA,
+      ramp_cap_mA)`). Avoids the dithering hazard where a controller
+      oscillating across SOFT_START_I_MA would produce non-monotonic
+      IOUT_LIMIT register writes — the chip's I_limit must climb
+      monotonically during the ramp regardless of controller activity.
+    - Ramp window strictly < FAULT_GRACE_MS so the supply-Vlim and
+      fan-tach grace checks fully cover the ramp. Compile-time
+      #error guards in CryoSnap.ino enforce this invariant.
+    - One-shot `_ramp_armed` flag (NOT an `_enable_time` inequality)
+      to avoid millis()-rollover, boot-zero, and silent-rename
+      failure modes.
+    - Stream telemetry mutates drive_mA in place after the ramp so
+      the operator-visible plotter shows the value actually written
+      (not the controller's commanded value). Without this the
+      plotter would read full-drive while INA showed ramped current,
+      causing diagnostic confusion.
+
+    Pre-push review (workflow wf_e9e5d234-632, 2026-06-09): six
+    parallel adversarial lenses found four majors and seven minors;
+    four were applied in this commit, three were deferred (see risk
+    register below). Cross-lens hits — _tps_only_recover not
+    re-arming the ramp, deadband-exit slamming because the comment
+    claimed it was harmless without evidence, PID dithering producing
+    non-monotonic writes — all closed by the monotonic-ceiling +
+    _ramp_armed redesign above.
+
+    Bench validation: MECHANISM CONFIRMED, EFFICACY INCONCLUSIVE.
+    The m4 drive_mA-mutate-in-place change makes the ramp visible
+    in stream telemetry. Run
+    ~/testing/logs/nopsu_v710_run1_20260609_023947.log (with the
+    v0.7.10 banner) shows the first INA stream sample after every
+    Enable:1 catching the ramp at varying points:
+      Enable A first sample:  Drive=-200 mA   INA=0.001 A  (t≈0)
+      Enable B first sample:  Drive=-1186 mA  INA=0.159 A  (t≈100 ms)
+      Enable C first sample:  Drive=-3129 mA  INA=2.086 A  (t≈300 ms)
+      Enable D first sample:  Drive=-5043 mA  INA=2.086 A  (t≈500 ms)
+      Enable * second sample: Drive=-6000 mA  INA≈5.6 A    (post-ramp)
+    The monotonic Drive value across each sample corresponds to
+    `ramp_cap_mA` advancing through the SOFT_START_MS window. The
+    ramp is mechanically working as designed.
+
+    Efficacy is INCONCLUSIVE at this N. Across 3 paired Phase-4
+    sessions with PD attached:
+      v0.7.9 Run B (no ramp):                2 CDC=0xE0 events
+      v0.7.10 pre-banner-fix (ramp in code): 1 CDC=0xE0 event
+      v0.7.10 banner-fixed (this commit):    2 CDC=0xE0 events
+    Range 1–2 with no clear directionality. The pre-push adversarial
+    review (workflow wf_e9e5d234-632) is right that N≥5 paired runs
+    with controlled ambient + uptime are needed before any "X%
+    reduction" claim. Phase-5 cumulative chip-lockup still fires in
+    all v0.7.10 runs — that lockup is the BUG-003-addendum hardware
+    ceiling (no I2C soft-reset, EN tied to AREF on Rev A; firmware
+    has no PVIN-cycle path).
+
+    Pre-push review (workflow wf_e9e5d234-632): six parallel
+    adversarial lenses found 4 majors and 7 minors. Applied here:
+    M1 (_tps_only_recover now re-arms the ramp via _ramp_armed
+    flag), M2 (deadband-exit re-arms via SOFT_START_RESET_GAP_MS
+    gap), M3 (monotonic ceiling formula replaces the dithering-
+    prone conditional scale), m1 (Config.h doc no longer mentions
+    the dropped V_limit ramp), m2 (_ramp_armed flag replaces the
+    _enable_time inequality, closing 3 minor failure modes), m4
+    (drive_mA mutated in place so plotter shows ramp shape).
+    Deferred: M4 (runtime imax/vmax/load/defaults race against the
+    ramp window — narrow, only triggers if operator retunes within
+    the first 600 ms after enable), m3 (MINIMAL_BUILD soft-start
+    enable — debatable), m5 (runtime `softstart 0|1` toggle —
+    convenience), m6 (SOFT_START_MS=600 provenance — needs a scope
+    measurement on the rig that we don't yet have).
+
+    Flash: +200 B (30506 -> 30706; 99.95% / 14 B free). RAM: +9 B
+    (1 B bool _ramp_armed + 4 B _ramp_start_ms + 4 B _last_actuate_ms).
+    The 14 B free is a hard ceiling — any further addition to this
+    branch needs to either fit in 14 B or earn its way in by
+    trimming something else.
+
+  0.7.9  2026-06-05  BUG-003 addendum — NACK-aware writes/reads, CDC drift detect
+
+    Bench validation (rig: Arduino Nano + TPS55288 EVM,
+    2026-06-08, full test_nopsu.py v1.1 protocol end-to-end).
+    Two runs:
+
+      Run A — no Vin on screw terminal, USB power only
+      (FAULT[NOPSU] expected, since the chip cannot sustain
+      V_limit > 5 V without Vin). Phase 5 (field-trigger
+      replication) latched FAULT[NOPSU] at +3.41 s
+      post-enable, trigger `trg V=5001` — the legitimate
+      V_limit-floor trigger (5001 mV < SUPPLY_VLIM_FLOOR of
+      5500 mV; the TPS auto-resets to its 5 V safety default
+      under USB-only power). Phase 4 toggles 1-7 read
+      CDC=0xE0 (chip reset by transients), toggles 8-11
+      recovered to CDC=0xA0 via task_diag's drift check
+      calling _tps_only_recover between toggles, toggles
+      12-15 back to 0xE0 (chip resetting faster than the
+      1 Hz drift check could catch — expected hardware-limit
+      symptom). 4 NOPSU latches across the test (~16 actual
+      triggers, all V_limit-floor), 11 CDC drifts. Log:
+      ~/testing/logs/nopsu_v0.7.9_20260608_041928.log.
+
+      Run B — USB-PD source attached (20 V / 3250 mA;
+      negotiated budget=61750 mW). NOPSU faults: 0. The
+      original BUG-003 was firmware mis-tripping NOPSU even
+      when the chip was healthy; with adequate supply the
+      fault no longer fires spuriously. Phase 5 (field-
+      trigger replication) drove a clean 2000 mA for the
+      full 4 s grace window with no fault — INA at trip-
+      window end: I=1.934 A, V=2.426 V, P=4.688 W. Phase 3
+      sustained 6000 mA / ~60 W for 90 s with no faults and
+      CDC stayed 0xA0 throughout. Phase 4 saw 2 CDC=0xE0
+      drifts (toggles 7 and 15), both correlated with
+      legitimate FAULT[PD]: lost 20V for 500 ms events from
+      the upstream source briefly dropping under rapid load
+      swings — the fault chain correctly latched
+      FAULT_HUSB_20V for those (not NOPSU), and CDC
+      recovered to 0xA0 by the next toggle. Total: 0 NOPSU,
+      2 FAULT[PD], 2 CDC drifts (both recovered). Log:
+      ~/testing/logs/nopsu_v0.7.9_PD_20260608_083017.log.
+
+    Caveat: the new Fix-1 NACK-counter trigger was NOT
+    exercised by either run (chip ACKed every write — the
+    failure mode in Run A was register state, not bus
+    state); it remains a theoretical fix verified by code
+    review only. The PD-clamp NACK-aware behavior was also
+    not exercised (PD budget never reached the clamp
+    threshold in Run B's drive profile).
+
+
+    The 0.7.8 fix for BUG-003 (tps_isPresent ACK probe before the
+    V_limit read) closed the "chip fell completely off the bus"
+    case but bench evidence in the BUG-003 addendum (logs/Bug-003
+    Addendum/BUG-003_addendum_v0.7.8.md, 2026-06-05) showed a
+    second failure mode after a v1.1 NOPSU test ended cleanly:
+    FAULT[NOPSU] tripping later, with the chip register dump
+    showing stale Phase-4 PD-clamp residuals (CDC=0xE0,
+    Vlim=15.25V from clamp_mV write, Ilim=5.00A from clamp_mA)
+    that should have been wiped by Phase-5's enable -> _pd_reinit
+    -> tps_init sequence.
+
+    Root cause: two independent gaps combined.
+
+      Gap A (writes silently NACK): _tps_write discarded
+      Wire.endTransmission's return value. During Phase 4's
+      high-current toggles the TPS Vin was dipping enough to
+      NACK individual write transactions even though the
+      address probe still ACK'd. _pd_reinit -> tps_init
+      "succeeded" by return value while its writes never
+      landed; firmware then cleared g_pd_clamped and
+      _supply_fault_count, thinking the chip was at safe
+      defaults while it was actually still at the Phase-4 clamp
+      residuals.
+
+      Gap B (probe-then-read race): tps_isPresent is one
+      transaction; tps_getVoltageLimitMV does three more. If
+      the chip NACKs one of the three reads, Wire.read() returns
+      0, the decoder produces ~200 mV, and _supply_fault_count
+      increments for a non-event. Combined with 0.7.5's sticky
+      counter, two glitches anywhere in a session = NOPSU latch.
+
+    Fixes (all four addendum recommendations):
+
+    Fix 1 (Gap A): _tps_write now returns Wire.endTransmission's
+    status. _tps_read tracks a sticky `_tps_last_read_ok` flag,
+    exposed via the new tps_lastReadOk() helper. tps_init,
+    tps_setVoltageLimit, tps_setCurrentLimit, tps_setOutput all
+    return bool — true only when ALL their writes ACK'd and the
+    read-modify reads succeeded. _tps_only_recover retries once
+    after a 20 ms settle (closer to TPS UVLO de-glitch / soft-
+    start than the original 2 ms first attempt); if it still
+    fails, it logs `DIAG: tps_init writes NACKed -- chip state
+    uncertain, retry deferred`, increments the new
+    _tps_write_nack_count, and clears g_pd_clamped so actuate
+    can take over (otherwise the clamp gate starves the NACK
+    fault path of failed writes). _supply_fault_count,
+    _supply_fault_last_bad_mv, and _tried_drive_last_tick are
+    preserved on failure so a persistent supply problem
+    correctly re-latches NOPSU after FAULT_GRACE_MS.
+
+    The task_100ms actuate stage now tracks whether its V/I
+    writes succeeded and only arms _tried_drive_last_tick when
+    they did. Without this gate, a NACK'd actuate write would
+    let the next supply check mis-interpret the chip's
+    previous (unchanged) V_limit as our deliberate command.
+
+    Fix 2 (CDC drift detect): task_diag (1 s cadence) now reads
+    the CDC register via the new tps_getCDC() helper and compares
+    to TPS_CDC_OPMODE. A mismatch means the chip silently reset
+    its registers — recover via _tps_only_recover(). This
+    catches the exact addendum dump state (chip alive on I2C,
+    CDC reverted to 0xE0).
+
+    Fix 3 (NACK-aware V_limit read): tps_getVoltageLimitMV
+    returns the new TPS_VLIM_READ_FAIL sentinel (0xFFFF) if any
+    of its three register reads NACK'd. The supply check
+    interprets the sentinel as "this tick is unreliable, skip"
+    rather than as a 65535 mV reading or as the decoded ~200 mV
+    that the old code would have produced.
+
+    Fix 4 (trip telemetry): every increment of
+    _supply_fault_count now logs `DIAG: NoPSU counter=N/M
+    Vlim=X mV` so the trigger trajectory is visible in serial
+    logs (max 2 lines per session at debounce=2). The
+    FAULT[NOPSU] trip print also includes the last bad V_limit
+    value (or "NACK during read burst" if the sentinel fired),
+    so post-trip debugging doesn't have to guess what drove the
+    counter when the post-trip register dump looks healthy.
+
+    Validation per the addendum: re-run test_nopsu.py v1.1 in
+    logs/Bug-003 Addendum/ (engagement-internal test tooling,
+    not shipped with the firmware) unchanged; expect no NOPSU
+    during the test (already passes in 0.7.8) AND no NOPSU
+    after the test ends and the monitor disables console mode.
+    The addendum also recommends a Phase 6 extension that holds
+    enable for another 10-20 s past Phase 5 to catch future
+    regressions of this exact pattern without depending on
+    monitor housekeeping timing.
+
+    Adversarial-review follow-ups (also in this commit)
+    ---------------------------------------------------
+    A 5-lens / 8-subagent workflow caught three real majors plus
+    several minors, all fixed before commit.
+
+    - Forward declaration: _tps_only_recover is now called from
+      Diagnostics.h (task_diag CDC branch) but was defined AFTER
+      that #include. The build worked only via Arduino IDE's
+      auto-prototyping for static .ino functions — fragile and
+      inconsistent with the explicit forward-decl pattern used
+      for _pd_reinit. Added the matching forward declaration.
+
+    - Alive-but-NACKing chip silently never triggered NOPSU.
+      The Fix-1 gating set _tried_drive_last_tick = writes_ok;
+      if writes kept NACKing, _tried_drive stayed false forever,
+      the supply check fell into its reset branch every tick,
+      and the counter never accumulated. New
+      _tps_write_nack_count tracks consecutive ticks where the
+      actuate stage tried to drive but its writes NACK'd;
+      TPS_NACK_FAULT_DEBOUNCE (5) consecutive failures latch
+      FAULT_NO_SUPPLY with a distinct "TPS writes NACK xN --
+      supply likely brown-out" trigger string. Also incremented
+      when _tps_only_recover fails both attempts (same root
+      cause, different code path).
+
+    - g_pd_clamped unreleasable when _tps_only_recover keeps
+      failing. The failure leg deliberately preserved
+      g_pd_clamped (to keep firmware state aligned with the
+      chip), but that meant actuate skipped V/I writes (gated
+      on !g_pd_clamped), the NACK counter never advanced from
+      fresh failed writes, and the operator was stuck with a
+      latched clamp and no path to recovery short of power
+      cycling. Failure leg now also clears g_pd_clamped, so
+      actuate tries fresh writes which either succeed (chip
+      back) or surface as NACKs through the new fault path.
+
+    Smaller items in the same round:
+      * tps_setVoltageLimit early-returns when its VOUT_FS read
+        NACKs — was writing garbage `fs` bits before returning
+        false. Matches tps_setOutput's pattern.
+      * TPS_VLIM_READ_FAIL #define moved above tps_getVoltageLimitMV
+        so the function body uses the macro name, not the bare
+        literal. Sentinel value is now defined in one place.
+      * _supply_fault_last_bad_mv no longer overwritten on
+        NACK ticks (those don't contribute to the trip; the
+        per-tick DIAG line still records NACKs in the serial
+        log). Prevents the trip print from mis-attributing a
+        real low-Vlim trigger as "NACK during read burst".
+      * _supply_fault_last_bad_mv now cleared in
+        _tps_only_recover's success leg alongside the other
+        supply-check state, so the trio resets atomically.
+      * COMPACT_FAULT_MSGS FLT[6] print now handles all three
+        cases (NACK-counter trigger, sentinel, real value) —
+        was printing "last=65535" on the sentinel case.
+
+    Second-pass adversarial review (this commit also closes the
+    follow-up findings from that pass):
+
+    - PD CLAMP block was discarding write returns and latching
+      g_pd_clamped=true unconditionally. A NACK'd clamp write
+      under brown-out would short-circuit ALL THREE fault paths
+      (clamp re-fire, NOPSU via V_limit, NOPSU via NACK count)
+      because actuate skips writes under clamp, gated branches
+      go quiet, chip stays at full drive. Fixed: check both
+      tps_setVoltageLimit and tps_setCurrentLimit returns, only
+      latch g_pd_clamped if both ACK'd. On write NACK, log
+      `WARN clamp write NACK -- supply brown-out, NOPSU will
+      latch via NACK path` and leave g_pd_clamped false so the
+      NACK counter accumulates normally.
+
+    - NACK counter coupling to controller state — three related
+      defects:
+        (a) _pid_full_reset() was clearing _tps_write_nack_count
+            on every enable / pid / mode gesture. The enable
+            path runs _pd_reinit() -> _tps_only_recover() (which
+            may bump the counter on failure) THEN _pid_full_reset
+            (which wiped it). Recovery-leg increments dead on
+            the enable path.
+        (b) Same coupling meant mode-switch pot noise (poll runs
+            every loop iteration via _set_mode) would wipe the
+            counter every flicker, indefinitely deferring the
+            FAULT[NOPSU] latch under a real brown-out.
+        (c) The actuate else branch was zeroing the counter on
+            every non-driving tick. Deadband-edge oscillation
+            under a marginal-Vin chip resets the watchdog every
+            other tick — same shape as the original
+            silent-NACK bug.
+      Fix: _tps_write_nack_count is now hardware-health state,
+      decoupled from controller intent. Removed the zero from
+      _pid_full_reset and from the actuate else branch. Natural
+      success paths (writes_ok=true actuate tick, successful
+      _tps_only_recover) clear it; a chip that has genuinely
+      recovered sees writes_ok=true and the counter drops to 0
+      without help.
+
+    - _tps_only_recover silently released g_pd_clamped. CDC
+      drift recovery at 1 Hz could disarm a deliberately-latched
+      clamp with no operator-visible message. Fixed by clearing
+      g_pd_clamped in both legs so the actuate stage can take
+      over. NOTE: the explicit `DIAG: PD clamp released ...`
+      print added during review was REMOVED in the final
+      revision to fit the 30720 B flash budget (see flash
+      budget note below); the release is now silent but
+      observable indirectly via the resumed actuate writes.
+
+    Flash budget note (bench, 2026-06-08, Arduino Nano,
+    arduino:avr:nano:cpu=atmega328 → 30720 B sketch max):
+    the v0.7.8 baseline shipped at 30206 B (98%, 514 B free).
+    The full set of addendum fixes plus their reviewer-requested
+    DIAG/WARN prints came in at 31516 B — 796 B over budget.
+    To fit, the following messages were trimmed from the verbose
+    branch (COMPACT_FAULT_MSGS=0, the default):
+      * `DIAG: tps_init writes NACKed ...` (recover-failure leg)
+      * `DIAG: TPS not on I2C -- attempting reinit` (task_safety)
+      * Per-tick `DIAG: NoPSU counter=N/M Vlim=N mV` (task_safety
+        supply-check; the trip-time `trg V=N` line below FAULT
+        [NOPSU] still records the latch-point value)
+      * `DIAG: PD clamp released by TPS recover (success/failure
+        leg)` — both legs now clear silently
+      * `WARN clamp write NACK -- supply brown-out, ...`
+        (PD-clamp NACK leg now silent)
+      * `  clamp latched until re-enable` (clamp success leg)
+      * `DIAG: TPS CDC drift (got 0xN expected 0xN) -- chip
+        reset detected, reinit` (CDC drift now silent)
+      * FAULT[NOPSU] message body shortened from the original
+        100-char operator-friendly form to
+        `FAULT[NOPSU]: no USB-PD or Vin<12V`
+      * Trip-time trigger string `  trigger: TPS writes NACK
+        xN -- supply likely brown-out` shortened to `  trg
+        NACKxN`; `  trigger: last bad Vlim = N mV` to
+        `  trg V=N`
+      * The dead `_supply_fault_last_bad_mv == TPS_VLIM_READ_FAIL`
+        sentinel branches in both COMPACT and verbose trip
+        prints removed (the value is never assigned to the
+        sentinel — verified by reading every write site)
+    Behavior is unchanged; only the human-readable string layer
+    is terser. Final size: 30506 B (99%, 214 B free). If a
+    future change adds another DIAG channel that pushes over,
+    consider gating the v0.7.9 DIAG channel block behind a new
+    NACK_DIAG_VERBOSE define so the strings come back for
+    bench debugging on a non-flash-constrained build.
+
+    - Documentation drift: the original Fix-1 paragraph
+      (retry delay, state-clear list) referenced 2 ms and an
+      outdated state-preserve list. Updated to match the final
+      behavior (20 ms retry, only g_pd_clamped + NACK counter
+      touched on failure, supply counters preserved). Stale
+      comments in TPS55288.h tps_init() and CryoSnap.ino
+      _pd_reinit() / _tps_only_recover() updated too.
 
   0.7.8  2026-06-05  PID rework — conditional integration, deriv-on-measurement, real dt
 

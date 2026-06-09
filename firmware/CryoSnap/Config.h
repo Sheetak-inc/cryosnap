@@ -123,6 +123,22 @@
 //       sees the negotiated USB-PD wattage. Belt-and-braces
 //       protection on top of the TPS hardware current limiter.
 //
+//   ENABLE_SOFT_START         ~150 B flash, 9 B RAM
+//       Linear I_limit ramp on the rising edge of every actuating
+//       window, so neither PID nor bang-bang slams the TEC with full
+//       commanded current the instant OE asserts. Lives above both
+//       controllers — direction is decided by the controller and
+//       applied unchanged. Window stays strictly inside
+//       FAULT_GRACE_MS so the supply-Vlim and fan-tach grace checks
+//       cover the ramp. Ramp re-arms on three triggers: operator
+//       enable, chip recovery via _tps_only_recover, and any actuate
+//       gap longer than SOFT_START_RESET_GAP_MS (deadband stay).
+//       Addresses BUG-003 Phase-5 enable-edge inrush. NOT a fix for
+//       the chip-lockup ceiling — see Version.h v0.7.10 notes.
+//       Tuning: SOFT_START_MS, SOFT_START_I_MA,
+//       SOFT_START_RESET_GAP_MS below. V_limit is NOT ramped (a TEC
+//       is current-limited; V_limit is just a ceiling).
+//
 //   ENABLE_VERBOSE_BOOT       ~250 B flash
 //       Boot banner, EEPROM blank/loaded message, PD reinit
 //       chatter, init warnings. Off = silent boot, ready prompt.
@@ -191,6 +207,7 @@
   #define ENABLE_LED_FADE           0
   #define ENABLE_FAULT_LED_FLASH    1
   #define ENABLE_PD_BUDGET_CLAMP    0
+  #define ENABLE_SOFT_START         0
   #define ENABLE_VERBOSE_BOOT       0
   #define ENABLE_SAFETY_FAULTS      0
   #define ENABLE_OLED_DISPLAY       0
@@ -221,6 +238,45 @@
 #endif
 #ifndef ENABLE_PD_BUDGET_CLAMP
 #define ENABLE_PD_BUDGET_CLAMP    1
+#endif
+#ifndef ENABLE_SOFT_START
+#define ENABLE_SOFT_START         1
+#endif
+// Soft-start ramp tuning (only used when ENABLE_SOFT_START=1).
+//
+// SOFT_START_MS — ramp duration (linear interpolation from
+//   SOFT_START_I_MA up to g_imax_mA). Must stay strictly below
+//   FAULT_GRACE_MS (3000) so the supply-Vlim and fan-tach grace
+//   windows cover the full ramp. Compile-time guard in
+//   CryoSnap.ino enforces this (placed there because FAULT_GRACE_MS
+//   lives in CryoSnap.ino, included after this header). Default
+//   600 ms: chosen as a "comfortably under the 3 s grace window"
+//   value; not yet derived from a scope measurement of actual
+//   inrush envelope — see Version.h v0.7.10 risk register.
+//
+// SOFT_START_I_MA — starting current at ramp t=0. 200 mA picked to
+//   stay clear of the SUPPLY_VLIM_FLOOR-driven supply check trigger
+//   (which keys on V_limit, not I_limit, but a tiny non-zero current
+//   write makes chip-side telemetry less ambiguous).
+//
+// SOFT_START_RESET_GAP_MS — gap (ms) of "no actuating tick" that
+//   triggers a fresh ramp on the next actuate. Default 500 ms:
+//   comfortably above the 100 ms scheduler period (deadband entry
+//   alone won't re-arm) but well below typical thermostat deadband
+//   stays (so a multi-second deadband followed by a re-drive gets a
+//   fresh ramp). Compile-time constant only; no runtime knob.
+//
+// V_limit is NOT ramped: for a TEC (low-impedance resistive + Seebeck
+// EMF) V_limit is a ceiling that never engages during drive, so
+// ramping it would cost ~50 B flash for no inrush benefit.
+#ifndef SOFT_START_MS
+#define SOFT_START_MS             600
+#endif
+#ifndef SOFT_START_I_MA
+#define SOFT_START_I_MA           200
+#endif
+#ifndef SOFT_START_RESET_GAP_MS
+#define SOFT_START_RESET_GAP_MS   500
 #endif
 #ifndef ENABLE_VERBOSE_BOOT
 #define ENABLE_VERBOSE_BOOT       1

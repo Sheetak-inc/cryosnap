@@ -169,8 +169,34 @@ static bool _husb_was_attached = false;
 // reset everything on every enable rising edge.
 #define SUPPLY_VLIM_FLOOR    5500  // mV — V_limit at or below this after a drive attempt = chip auto-reset
 #define SUPPLY_FAULT_DEBOUNCE   2  // bad reads anywhere in the drive session before latching
-static uint8_t _supply_fault_count    = 0;
-static bool    _tried_drive_last_tick = false;
+static uint8_t  _supply_fault_count       = 0;
+static bool     _tried_drive_last_tick    = false;
+// Captured for the FAULT[NOPSU] trip print so the operator can see
+// the V_limit value that drove the counter (BUG-003 addendum Fix 4).
+// TPS_VLIM_READ_FAIL (0xFFFF) here means the last bad event was a
+// NACK during the read burst, not a real low value.
+static uint16_t _supply_fault_last_bad_mv = 0;
+
+// Write-NACK debounce. The original BUG-003 addendum fixes the
+// SILENT case (writes don't land but the firmware thinks they did)
+// by gating _tried_drive_last_tick on write success. That gate
+// alone has a secondary failure mode: a chip alive-but-NACKing
+// every write leaves _tried_drive_last_tick=false forever, which
+// makes the supply check go to its reset branch every tick, which
+// means FAULT_NO_SUPPLY can NEVER latch — operator sees enable on,
+// fan running, no fault, no drive, no diagnostic.
+//
+// _tps_write_nack_count tracks consecutive ticks where the actuate
+// stage tried to drive but its writes NACK'd. Past
+// TPS_NACK_FAULT_DEBOUNCE, the fault chain latches FAULT_NO_SUPPLY
+// with a distinct "TPS NACKing" trigger string so the operator
+// sees that the supply (not the chip presence, not the V_limit
+// reset) is the issue. Also incremented when _tps_only_recover
+// fails both attempts — same root cause from a different code
+// path. Reset to 0 on any successful actuate-write tick or
+// successful _tps_only_recover.
+#define TPS_NACK_FAULT_DEBOUNCE 5  // ticks (500 ms) of consecutive NACKs before latch
+static uint8_t _tps_write_nack_count = 0;
 // Edge-trigger for "TPS dropped off I2C" — distinct failure mode
 // from "TPS is alive but supply is insufficient." Set false the
 // first tick tps_isPresent() returns false during a drive session;
@@ -193,6 +219,45 @@ static unsigned long _btn_last_change = 0;
 #define FAULT_GRACE_MS  3000  // 3 seconds after enable before checking fan tach
 
 static unsigned long _enable_time = 0;
+
+#if ENABLE_SOFT_START
+// Compile-time guards for the soft-start ramp. Placed here (not in
+// Config.h) because the constants they validate — SUPPLY_VLIM_FLOOR
+// and FAULT_GRACE_MS — are defined in this file AFTER Config.h is
+// included. Putting these checks in Config.h's fallback section would
+// see those symbols as undefined (substituted to 0 by the preprocessor)
+// and either silently pass or always fire — neither is what we want.
+#if SOFT_START_MS == 0
+  #error "SOFT_START_MS must be > 0; set ENABLE_SOFT_START=0 to disable the ramp entirely"
+#endif
+#if SOFT_START_MS >= FAULT_GRACE_MS
+  #error "SOFT_START_MS must be < FAULT_GRACE_MS so the supply/fan grace windows cover the full ramp"
+#endif
+
+// Soft-start ramp state.
+//
+//   _ramp_armed     = one-shot "start a new ramp on the next actuating
+//                     tick". Set by every site that needs the ramp to
+//                     re-fire (operator enable rising edge, chip
+//                     re-init via _tps_only_recover, long actuate gap
+//                     from deadband). Consumed inside the actuate
+//                     write block.
+//   _ramp_start_ms  = wall-clock zero of the current ramp, captured
+//                     when _ramp_armed is consumed.
+//   _last_actuate_ms= timestamp of the previous actuating tick; the
+//                     actuate block re-arms the ramp if too much time
+//                     has elapsed since (deadband-exit protection).
+//
+// The flag-based design replaces a v0.7.10 first-pass that compared
+// _enable_time != _ramp_for_enable_time as a session key. That
+// pattern was vulnerable to millis() rollover, boot-time 0/0
+// collision (any auto-enable feature), and silent rename typos. An
+// explicit one-shot flag is dumber and safer; the only contract is
+// "anywhere you want a ramp, set _ramp_armed=true."
+static bool          _ramp_armed       = false;
+static unsigned long _ramp_start_ms    = 0;
+static unsigned long _last_actuate_ms  = 0;
+#endif
 
 // ---- USB-PD power budget ------------------------------------------------
 // Computed at boot from the HUSB238 negotiated voltage and current.
@@ -221,6 +286,21 @@ static unsigned long _pid_last_ms = 0;
 // Wrap pid_reset() so we also re-arm the dt sentinel — every site that
 // clears PID state should also clear the dt history so the next compute
 // starts with a fresh, sane dt.
+//
+// IMPORTANT: this does NOT clear _tps_write_nack_count. The NACK
+// counter is a hardware-health signal, not controller state — it
+// must NOT be wiped by operator-controller gestures (pid toggle,
+// mode change, even enable rising edge). If we cleared it here:
+//   - mode-switch pot noise would call _set_mode -> _pid_full_reset
+//     every loop iteration, indefinitely deferring FAULT[NOPSU] latch
+//     under a real brown-out.
+//   - the enable handler's _pd_reinit -> _tps_only_recover failure
+//     leg increment would be wiped on the very next line by this
+//     reset, defeating the documented "half second to latch" path.
+// Natural clears happen at the right places: actuate-success and
+// _tps_only_recover-success both zero the counter; a chip that has
+// genuinely recovered will see writes_ok=true on the next actuate
+// tick and the counter drops to 0 with no help needed here.
 static inline void _pid_full_reset() {
   pid_reset();
   _pid_last_ms = 0;
@@ -249,8 +329,15 @@ static inline void _set_mode(uint8_t new_mode) {
 static void task_100ms();
 static void task_slow();
 
-// Forward declaration — defined below, called from SerialCmd.h and button handler.
+// Forward declarations — defined below.
+// _pd_reinit:        called from SerialCmd.h enable handler + button enable.
+// _tps_only_recover: called from Diagnostics.h CDC-drift branch + the
+//                    supply check's TPS-absent branch (also from _pd_reinit
+//                    itself). Without this forward decl the include of
+//                    Diagnostics.h further down would only resolve via
+//                    Arduino IDE's auto-prototyping, which is brittle.
 static void _pd_reinit();
+static void _tps_only_recover();
 
 // Settings.h and SerialCmd.h both reference runtime state declared
 // above, so they must be included here — after the state block,
@@ -278,13 +365,88 @@ static void _pd_reinit();
 // state: that stays under the explicit enable-cycle path so a
 // concurrent PD drop is not silently swallowed. Caller manages the
 // `_tps_was_present` edge flag.
+//
+// State-clear gating (BUG-003 addendum 2026-06-05): on the SUCCESS
+// leg we clear g_pd_clamped, the supply counters, last-bad-mV, and
+// the NACK counter — the chip is now at safe defaults via tps_init.
+// On the FAILURE leg we touch ONLY two things:
+//   (a) increment _tps_write_nack_count so the NOPSU fault chain
+//       eventually latches via the NACK path (the operator must
+//       see SOMETHING when recovery is broken)
+//   (b) clear g_pd_clamped — leaving it set would gate actuate
+//       out of writes (gated on !g_pd_clamped) and starve the
+//       NACK counter of fresh failed writes, producing the
+//       stuck-clamp state the second-round adversarial review
+//       flagged.
+// _supply_fault_count, _supply_fault_last_bad_mv, and
+// _tried_drive_last_tick are preserved on failure so a persistent
+// supply problem can re-latch the e1 trigger after FAULT_GRACE_MS.
+// Retry once after a 20 ms settle (TPS UVLO de-glitch ~ ms).
 static void _tps_only_recover() {
-  tps_init();
-  _supply_fault_count    = 0;
-  _tried_drive_last_tick = false;
+  bool ok = tps_init();
+  if (!ok) {
+    // 20 ms gives a brown-out / UVLO de-glitch room to settle — the
+    // chip's soft-start is several ms and 2 ms wasn't enough on
+    // bench. Still well inside any task budget we'd call this from
+    // (worst case slow task at 1 s cadence).
+    delay(20);
+    ok = tps_init();
+  }
+  if (!ok) {
+    // No print here — the chip is broken, increments below propagate
+    // to FAULT[NOPSU] "trg NACKx N" with the same information.
+    // Increment the persistent-NACK counter so the operator-visible
+    // FAULT[NOPSU] latch eventually fires even when the chip is
+    // alive-but-NACK. Without this, repeated recovery failures stay
+    // silent (the supply-check counter resets every tick because
+    // _tried_drive_last_tick is false). NOTE: combined with actuate
+    // NACKs on the next tick, total latch latency to FAULT[NOPSU] is
+    // a few hundred ms past the FAULT_GRACE_MS window.
+    if (_tps_write_nack_count < 0xFF) _tps_write_nack_count++;
+    // Also clear g_pd_clamped on the failure leg. If we leave it
+    // set, the actuate stage will skip its V/I writes (gated on
+    // !g_pd_clamped), starving the NACK counter of fresh failed
+    // writes and leaving the operator with a stuck-clamp state
+    // they can only clear by power-cycling. Clearing it allows
+    // actuate to try fresh writes which either succeed (chip is
+    // back, good) or NACK (count keeps climbing to the latch).
+    // Print a release message so the operator sees the clamp went
+    // away — without this, a CDC-drift recovery at 1 Hz can
+    // silently disarm a deliberately-latched clamp.
+    // Clear clamp silently — operator sees the trip via FAULT[NOPSU]
+    // (NACK counter increments above ensure it fires).
+    g_pd_clamped = false;
+    // CAVEAT for future maintainers: task_diag's CDC drift check
+    // (1 s cadence) only catches the alive-and-CDC-readable case
+    // — if the chip is alive enough to ACK its address but also
+    // NACKing reads, even that diagnostic path can't recover. The
+    // NACK count above is the only path that will surface this
+    // state to the operator. Don't tighten the failure leg to
+    // skip the counter increment "because task_diag will catch it"
+    // — task_diag won't.
+    return;
+  }
+  _supply_fault_count       = 0;
+  _supply_fault_last_bad_mv = 0;
+  _tried_drive_last_tick    = false;
+  _tps_write_nack_count     = 0;
   // Also clear the PD-budget clamp — tps_init() reset the chip's V/I
   // registers, so any clamp the firmware had asserted is stale.
-  g_pd_clamped           = false;
+  // Print a release message so the operator sees a deliberately-
+  // latched clamp going away (CDC drift in task_diag at 1 Hz can
+  // get here without an operator gesture).
+  // Clear clamp silently — recovery success is observable via the
+  // resumed actuate writes and the absence of further NACK trips.
+  g_pd_clamped = false;
+#if ENABLE_SOFT_START
+  // Re-arm the I_limit ramp: tps_init() just took the chip back to
+  // safe defaults and its output cap was likely discharged by the
+  // brown-out that triggered recovery. Without this, the next
+  // actuate tick would slam the (still-stale) ramp_elapsed-past-
+  // window value straight into a freshly-reset chip — the exact
+  // BUG-003 Phase-5 inrush at the moment soft-start matters most.
+  _ramp_armed = true;
+#endif
 }
 
 static void _pd_reinit() {
@@ -309,7 +471,12 @@ static void _pd_reinit() {
 #endif
   }
 #endif
-  _tps_only_recover();         // tps_init + supply-state reset + g_pd_clamped clear
+  // tps_init + supply-state reset + g_pd_clamped clear. On the
+  // failure leg, only g_pd_clamped and _tps_write_nack_count are
+  // touched — supply counters and last-bad-mV are preserved so a
+  // persistent supply problem correctly re-latches NOPSU after
+  // FAULT_GRACE_MS.
+  _tps_only_recover();
   _husb_fault_count = 0;
   // Re-arm the sticky "PD ever attached" detector. If the operator
   // is re-enabling after a PD fault (cable knocked loose, source
@@ -576,6 +743,9 @@ void loop() {
               _pd_reinit();            // re-negotiate PD if needed
               _pid_full_reset();       // clear stale integral + derivative + dt history
               ctrl_on_enable();        // kick off armed schedule, if any
+#if ENABLE_SOFT_START
+              _ramp_armed = true;      // arm I_limit ramp; consumed at first actuating tick
+#endif
             }
             Serial.print(F("Enable: "));
             Serial.println(g_enabled ? F("ON") : F("OFF"));
@@ -738,7 +908,8 @@ static void task_100ms() {
       // so a concurrent PD drop is still caught by the regular
       // FAULT_HUSB_20V chain.
       if (_tps_was_present) {
-        Serial.println(F("DIAG: TPS not on I2C -- attempting reinit"));
+        // Silent reinit — _tps_only_recover increments NACK counter
+        // on failure, surfacing eventually via FAULT[NOPSU].
         _tps_only_recover();
         _tps_was_present = false;  // suppress re-fire until chip recovers
       }
@@ -746,8 +917,33 @@ static void task_100ms() {
       // Chip is alive — re-arm the edge so a future disappearance
       // triggers a fresh DIAG + recovery, then check V_limit.
       _tps_was_present = true;
-      if (tps_getVoltageLimitMV() <= SUPPLY_VLIM_FLOOR) {
+      uint16_t vlim = tps_getVoltageLimitMV();
+      if (vlim == TPS_VLIM_READ_FAIL) {
+        // One or more of the three reads NACK'd between the
+        // tps_isPresent() probe and the data fetch. This is the
+        // marginal-Vin transient pattern documented in BUG-003
+        // addendum 2026-06-05 — chip is alive but a read failed
+        // mid-burst. Without this sentinel we'd decode the zeros
+        // as ~200 mV and increment the counter for a non-event.
+        // Skip this tick. Do NOT overwrite _supply_fault_last_bad_mv:
+        // if the counter was already accumulating from real low
+        // readings, the trip print would mislabel the trigger as
+        // "(NACK during read burst)" when the actual cause was a
+        // legitimate Vlim drop. The per-tick DIAG below still
+        // captures NACK occurrences in the serial log for
+        // correlation.
+      } else if (vlim <= SUPPLY_VLIM_FLOOR) {
         _supply_fault_count++;
+        _supply_fault_last_bad_mv = vlim;
+        // Log every increment so future audits don't have to guess
+        // what V_limit value drove the latch. Bounded by
+        // SUPPLY_FAULT_DEBOUNCE (2) outside the post-enable grace
+        // window, and by the grace window itself inside it (~30
+        // lines worst case at LOOP_INTERVAL_MS=100,
+        // FAULT_GRACE_MS=3000). (BUG-003 addendum Fix 4.)
+        // No per-tick print — trip-time "trg V=" line records the
+        // last bad reading at the latch point, which is enough for
+        // field debugging without burning flash on every increment.
       }
       // No reset on a good read while we're driving: the TPS oscillates
       // briefly between "trying to drive at Vmax" and "protected at 5 V"
@@ -762,8 +958,9 @@ static void task_100ms() {
     // check. Reset so a fresh enable starts the assessment from
     // zero. Also re-arm the TPS-present edge so a future
     // disappearance during real drive fires a fresh DIAG.
-    _supply_fault_count = 0;
-    _tps_was_present    = true;
+    _supply_fault_count       = 0;
+    _supply_fault_last_bad_mv = 0;
+    _tps_was_present          = true;
   }
 #endif
 
@@ -830,24 +1027,51 @@ static void task_100ms() {
     }
 #endif
 
-    // (e) Supply insufficient — TPS auto-reset V_limit to its 5 V
-    //     safety default for SUPPLY_FAULT_DEBOUNCE consecutive ticks
-    //     of attempted drive. Catches the Nano-on-PC-USB-only case
-    //     (no Vin, no USB-PD) that the earlier fixes correctly let
-    //     past the PD fault chain — without this check the user
-    //     sees enable accepted and then silent nothing because the
-    //     chip can't sustain the commanded voltage.
-    //     Skipped during the post-enable grace period (same window
-    //     the fan tach check uses) so soft-start + fan spin-up have
-    //     room to complete before we judge the supply.
-    else if (_supply_fault_count >= SUPPLY_FAULT_DEBOUNCE
+    // (e) Supply insufficient — two possible triggers, both folded
+    //     into FAULT_NO_SUPPLY because the operator-facing remedy is
+    //     the same ("check Vin / PD supply"):
+    //
+    //       (e1) TPS auto-reset V_limit to its 5 V safety default
+    //            for SUPPLY_FAULT_DEBOUNCE consecutive ticks of
+    //            attempted drive. The Nano-on-PC-USB-only case (no
+    //            Vin, no USB-PD) — chip is alive but can't sustain
+    //            the commanded voltage.
+    //
+    //       (e2) TPS write transactions NACK for
+    //            TPS_NACK_FAULT_DEBOUNCE consecutive ticks — chip
+    //            is alive enough to ACK its address but the
+    //            register writes don't land (BUG-003 addendum
+    //            follow-up). Catches marginal-Vin brownouts that
+    //            the (e1) signal would miss because
+    //            _tried_drive_last_tick stays false and the V_limit
+    //            counter never advances.
+    //
+    //     Both check the post-enable grace period (same window the
+    //     fan tach check uses) so soft-start + fan spin-up have
+    //     room to complete before judging the supply.
+    else if (((_supply_fault_count >= SUPPLY_FAULT_DEBOUNCE)
+              || (_tps_write_nack_count >= TPS_NACK_FAULT_DEBOUNCE))
              && (millis() - _enable_time) > FAULT_GRACE_MS) {
       g_fault = FAULT_NO_SUPPLY;
       g_enabled = false;
+      bool nack_trigger = (_tps_write_nack_count >= TPS_NACK_FAULT_DEBOUNCE);
 #if COMPACT_FAULT_MSGS
-      Serial.println(F("FLT[6]"));
+      if (nack_trigger) {
+        Serial.print(F("FLT[6] NACKx")); Serial.println(_tps_write_nack_count);
+      } else {
+        Serial.print(F("FLT[6] V=")); Serial.println(_supply_fault_last_bad_mv);
+      }
 #else
-      Serial.println(F("FAULT[NOPSU]: USBPD not available and supply voltage is insufficient (connect to USBPD or Vin > 12v)"));
+      Serial.println(F("FAULT[NOPSU]: no USB-PD or Vin<12V"));
+      // BUG-003 addendum Fix 4: print what actually drove the latch.
+      // _supply_fault_last_bad_mv is never set to TPS_VLIM_READ_FAIL
+      // (the NACK path deliberately leaves it untouched per the
+      // comment in section 3a) so we only handle two cases here.
+      if (nack_trigger) {
+        Serial.print(F("  trg NACKx")); Serial.println(_tps_write_nack_count);
+      } else {
+        Serial.print(F("  trg V="));   Serial.println(_supply_fault_last_bad_mv);
+      }
 #endif
     }
 
@@ -899,13 +1123,27 @@ static void task_100ms() {
     if (power_mW >= (float)g_pd_budget_mW) {
       uint16_t clamp_mV = (uint16_t)(ina_v * 1000.0f);
       uint16_t clamp_mA = (uint16_t)(ina_i * 1000.0f);
-      tps_setVoltageLimit(clamp_mV);
-      tps_setCurrentLimit(clamp_mA);
-      g_pd_clamped = true;
+      // Check write success before latching. The earlier code
+      // discarded both returns and unconditionally set
+      // g_pd_clamped=true; if either write NACK'd (the same
+      // marginal-Vin brown-out that drives most over-budget
+      // events in the first place), the chip stayed at its
+      // prior higher V/I limits while the firmware believed it
+      // was clamped. With g_pd_clamped=true the actuate stage
+      // skips ALL its V/I writes, the supply-Vlim NOPSU branch
+      // is gated off (!g_pd_clamped), the NACK counter doesn't
+      // climb (no actuate writes happening), and the chip stays
+      // at full drive over budget indefinitely. Only latch the
+      // clamp when the writes actually landed.
+      bool clamp_ok = tps_setVoltageLimit(clamp_mV);
+      clamp_ok = tps_setCurrentLimit(clamp_mA) && clamp_ok;
       Serial.print(F("PD CLAMP: "));
       Serial.print(clamp_mV); Serial.print(F(" mV / "));
       Serial.print(clamp_mA); Serial.println(F(" mA"));
-      Serial.println(F("  clamp latched until re-enable"));
+      // Latch silently on success; on NACK, leave g_pd_clamped false
+      // so actuate keeps re-writing and the NACK counter advances
+      // toward the TPS_NACK_FAULT_DEBOUNCE latch.
+      if (clamp_ok) g_pd_clamped = true;
     }
   }
 #endif
@@ -1088,17 +1326,106 @@ static void task_100ms() {
   // sequence (TPS off -> settle -> toggle -> TPS on).
 
   if (tec_on) {
+    // Track whether the V/I writes actually landed. If they NACK
+    // (marginal Vin during high-current drive), the chip is still
+    // at whatever it was previously holding — leaving
+    // _tried_drive_last_tick true here would let the next supply
+    // check mis-interpret a stale-but-not-our-fault V_limit reading
+    // as "we asked the chip to hold Vmax." (BUG-003 addendum Fix 1
+    // recommendation.) hb_safeDirectionChange is internal to
+    // HBridge.h and doesn't report its internal TPS off/on success
+    // — that's a deliberate contract gap; the actuate writes here
+    // are the ones that matter for the supply check.
+    bool writes_ok = true;
     if (!g_pd_clamped) {
-      tps_setCurrentLimit(drive_mA);
-      tps_setVoltageLimit(g_vmax_mV);
+#if ENABLE_SOFT_START
+      // Soft-start I_limit ramp. Lives above the controllers so PID
+      // and bang-bang get identical inrush protection without either
+      // needing knowledge of the ramp. V_limit is NOT ramped — for a
+      // TEC (low-impedance + Seebeck EMF) the I_limit is the binding
+      // constraint; V_limit is a ceiling that never engages during
+      // drive on this load type.
+      //
+      // Ramp re-arm triggers (any sets _ramp_armed=true):
+      //   (a) operator enable rising edge (button/serial enable
+      //       handlers — see CryoSnap.ino:733 / SerialCmd.h:258)
+      //   (b) _tps_only_recover success leg — chip just took fresh
+      //       defaults, output cap probably discharged by the
+      //       brown-out that triggered recovery
+      //   (c) actuate gap >= SOFT_START_RESET_GAP_MS — deadband-exit
+      //       protection. Brief inter-tick jitter passes; multi-tick
+      //       deadband stays during normal thermostat operation
+      //       re-arm the ramp so the next OE off->on doesn't slam.
+      //
+      // Monotonic ceiling formula (NOT a conditional scale on
+      // drive_mA): ramp_cap_mA grows linearly from SOFT_START_I_MA up
+      // to g_imax_mA over SOFT_START_MS, then sticks at g_imax_mA.
+      // ramp_mA = min(drive_mA, ramp_cap_mA). Avoids the dithering
+      // hazard where a controller oscillating across the
+      // SOFT_START_I_MA threshold (small PID near steady-state, or BB
+      // damping band) would produce non-monotonic I_limit register
+      // writes — chip's IOUT_LIMIT must be monotonically increasing
+      // during the ramp regardless of controller activity.
+      //
+      // uint32_t cast prevents 16-bit overflow at full scale
+      // (worst: ~5800 mA * 600 ms = 3.5e6, fits in uint32).
+      unsigned long now_ms = millis();
+      if (_ramp_armed ||
+          (now_ms - _last_actuate_ms) > SOFT_START_RESET_GAP_MS) {
+        _ramp_start_ms = now_ms;
+        _ramp_armed    = false;
+      }
+      uint16_t ramp_mA = drive_mA;
+      unsigned long ramp_elapsed = now_ms - _ramp_start_ms;
+      if (ramp_elapsed < SOFT_START_MS && g_imax_mA > SOFT_START_I_MA) {
+        uint16_t ramp_cap_mA = SOFT_START_I_MA +
+          (uint16_t)(((uint32_t)(g_imax_mA - SOFT_START_I_MA) * ramp_elapsed) / SOFT_START_MS);
+        if (ramp_mA > ramp_cap_mA) ramp_mA = ramp_cap_mA;
+      }
+      _last_actuate_ms = now_ms;
+      writes_ok &= tps_setCurrentLimit(ramp_mA);
+      writes_ok &= tps_setVoltageLimit(g_vmax_mV);
+      // Mutate drive_mA so the stream telemetry below prints the
+      // value actually written (not the controller's commanded
+      // value). Operator-visible plotter then shows the ramp shape;
+      // without this the plotter shows drive_mA=full while INA shows
+      // ramped current — diagnostic-confusing.
+      drive_mA = ramp_mA;
+#else
+      writes_ok &= tps_setCurrentLimit(drive_mA);
+      writes_ok &= tps_setVoltageLimit(g_vmax_mV);
+#endif
     }
     hb_safeDirectionChange(drive_dir);
-    tps_setOutput(true);
-    _tried_drive_last_tick = true;   // arm the supply-Vlim check for next tick
+    writes_ok &= tps_setOutput(true);
+    _tried_drive_last_tick = writes_ok;   // arm the supply-Vlim check for next tick
+    // Persistent-NACK tracking (BUG-003 addendum follow-up): if
+    // writes_ok stayed false for TPS_NACK_FAULT_DEBOUNCE consecutive
+    // ticks, the fault chain latches NOPSU below. Without this, the
+    // supply check (gated on _tried_drive_last_tick) goes to its
+    // reset branch every tick and the counter never accumulates —
+    // an alive-but-NACK chip would stay silent forever.
+    if (writes_ok) {
+      _tps_write_nack_count = 0;
+    } else if (_tps_write_nack_count < 0xFF) {
+      _tps_write_nack_count++;
+    }
   } else {
     tps_setOutput(false);
     hb_setDirection(HB_COOL);        // safe default when off
     _tried_drive_last_tick = false;  // chip's Vlim reading is meaningless when not driving
+    // NOTE: _tps_write_nack_count is NOT cleared here. Earlier
+    // revisions did, on the theory "no drive intent → no NACK
+    // pressure to track". But the deadband path enters this else
+    // branch every tick the |pid output| is below the 0.5 mA
+    // threshold or |error| <= deadband — and a controller that
+    // oscillates in and out of deadband with a chip alive-but-
+    // persistently-NACKing would wipe the watchdog every other
+    // tick, indefinitely deferring the FAULT[NOPSU] latch the
+    // counter was added to surface. The counter is hardware-
+    // health state, not controller-intent state; only natural
+    // success paths (a writes_ok=true actuate tick, or a
+    // _tps_only_recover success leg) drop it back to zero.
   }
 
   // Fan runs at the configured speed when enabled. When disabled, it

@@ -259,6 +259,9 @@ static void _cmd_execute(char* cmd) {
       _pd_reinit();
       _pid_full_reset();        // clear stale integral + derivative + dt history
       ctrl_on_enable();         // kick off armed schedule, if any
+#if ENABLE_SOFT_START
+      _ramp_armed = true;       // arm I_limit ramp; consumed at first actuating tick
+#endif
     }
     Serial.print(F("Enable:")); Serial.println(g_enabled ? '1' : '0');
   }
