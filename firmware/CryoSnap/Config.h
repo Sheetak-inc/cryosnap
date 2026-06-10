@@ -408,16 +408,33 @@
 // ============================================
 // Default Safety Limits
 // ============================================
+// All DEFAULT_* and tunable macros use the #ifndef pattern so a
+// command-line -D override (e.g. -DDEFAULT_MAX_CURRENT=0.3f for a
+// safety-restricted bring-up flash) actually takes effect. Caught on
+// the 2026-06-10 REVB bring-up: a bare #define silently shadows the
+// -D override and the runtime safety cap stays at the file value.
+#ifndef DEFAULT_MAX_TEMP_HOT
 #define DEFAULT_MAX_TEMP_HOT 60.0f  // Celsius
+#endif
+#ifndef DEFAULT_MAX_CURRENT
 #define DEFAULT_MAX_CURRENT   2.0f  // Amps (TPS55288 I_limit at boot)
+#endif
+#ifndef DEFAULT_MAX_VOLTAGE
 #define DEFAULT_MAX_VOLTAGE  12.0f  // Volts (TPS55288 V_limit at boot)
+#endif
+#ifndef DEFAULT_MAX_POWER
 #define DEFAULT_MAX_POWER    20.0f  // Watts
+#endif
 
 // ============================================
 // Default Control Settings
 // ============================================
+#ifndef DEFAULT_SETPOINT
 #define DEFAULT_SETPOINT     25.0f  // Celsius — target cold-side temp
+#endif
+#ifndef DEFAULT_FAN_SPEED
 #define DEFAULT_FAN_SPEED    180    // 0..255 PWM duty (180 ~ 70%)
+#endif
 // LED brightness scale, 0..255 (0 = off, 255 = full). 64 (~25%)
 // is comfortable indoors — the full-scale WS2812 chain is bright
 // enough to be uncomfortable on a bench desk. User-adjustable at
@@ -426,8 +443,12 @@
 //
 // To change the default: edit the value here; existing EEPROM
 // settings retain their stored value until `defaults` is run.
+#ifndef DEFAULT_LED_BRIGHTNESS
 #define DEFAULT_LED_BRIGHTNESS  64
+#endif
+#ifndef FAN_DISABLED_SPEED
 #define FAN_DISABLED_SPEED   127    // fan runs at ~50% even when TEC is off (passive cooling)
+#endif
 // Deadband — the window around the setpoint where the TEC is
 // completely off. Prevents the control loop from chattering (rapidly
 // switching on/off) when the measured temperature oscillates within
@@ -443,10 +464,16 @@
 //   - can oscillate the control loop indefinitely
 // Keep this >= 0.1 C. Larger values (0.5-1.0 C) are quieter but give
 // less precise temperature tracking.
+#ifndef DEFAULT_DEADBAND
 #define DEFAULT_DEADBAND     0.2f   // +/- degrees C — TEC off inside band
+#endif
 
+#ifndef DEFAULT_DAMPING_BAND
 #define DEFAULT_DAMPING_BAND 3.0f   // +/- degrees C — reduce current in band
+#endif
+#ifndef DEFAULT_DAMPING_PCT
 #define DEFAULT_DAMPING_PCT  50     // % of max current inside damping band
+#endif
 
 // PID controller tuning. Output is in milliamps; setpoint and
 // measured temperature are in degrees Celsius. dt is fixed at
@@ -457,21 +484,33 @@
 // integral correction. Kd starts at 0 because derivative kick on
 // setpoint changes is rarely worth the noise on an NTC-driven
 // loop until the rest of the loop is well-behaved.
+#ifndef DEFAULT_KP
 #define DEFAULT_KP   200.0f
+#endif
+#ifndef DEFAULT_KI
 #define DEFAULT_KI     5.0f
+#endif
+#ifndef DEFAULT_KD
 #define DEFAULT_KD     0.0f
+#endif
 
 // Default control mode for first boot / EEPROM reset.
 //   true  → PID controller
 //   false → bang-bang + damping (simpler fallback law, reachable
 //           via the `pid` console command for A/B comparison or
 //           when PID tuning is going sideways)
+#ifndef DEFAULT_USE_PID
 #define DEFAULT_USE_PID  true
+#endif
 
 // Mode switch analog thresholds (10-bit ADC on A6).
 // Full scale = Heat, Mid = Auto, Ground = Cool.
+#ifndef MODE_THRESH_COOL
 #define MODE_THRESH_COOL     256    // below this = Cool
+#endif
+#ifndef MODE_THRESH_AUTO
 #define MODE_THRESH_AUTO     768    // below this = Auto, above = Heat
+#endif
 
 // NTC temperature conversion — placeholder linear model.
 // T(C) = raw_ADC * NTC_SCALE + NTC_OFFSET

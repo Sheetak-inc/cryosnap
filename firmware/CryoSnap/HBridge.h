@@ -32,23 +32,20 @@
     hb_safeDirectionChange(dir) TPS off -> settle -> toggle -> TPS on
 */
 
-// H-bridge direction polarity. Bench-confirmed on Rev A 2026-06-03:
-// the production PCB wiring uses the same polarity as the prototype
-// (LOW = drive toward Heat side, HIGH = drive toward Cool side).
-// The earlier Rev A comment claimed the opposite — that was wrong,
-// and the device heated when commanded to cool. Tracked in BUG-000
-// of the audit log.
-//
-// TARGET_REVB is currently assumed to share Rev A's wiring. This is
-// an UNVERIFIED guess until someone exercises the heat/cool commands
-// on Rev B silicon and confirms the thermal direction matches the
-// labels. If a Rev B build heats when commanded to cool, swap the
-// HB_COOL/HB_HEAT pair in the TARGET_REVB branch below.
+// H-bridge direction polarity. Bench-confirmed identical on all three
+// targets (LOW = drive toward Heat side, HIGH = drive toward Cool):
+//   PROTO   bench prototype
+//   Rev A   confirmed 2026-06-03 (BUG-000 in the audit log; the
+//           earlier comment claimed the opposite, which was wrong)
+//   Rev B   confirmed 2026-06-10 — 200 mA Cool drive on the first
+//           assembled Rev B board produced a monotonic 1.00 C drop
+//           in Tcold over 47 s
+// If a future board build heats when commanded to cool, swap the
+// HB_COOL/HB_HEAT pair in the offending branch below.
 #if BUILD_TARGET == TARGET_PROTO
   #define HB_COOL  HIGH
   #define HB_HEAT  LOW
 #elif BUILD_TARGET == TARGET_REVB
-  #warning "TARGET_REVB H-bridge polarity is inherited from Rev A and is NOT bench-verified. See HBridge.h. If the device heats when commanded to cool, swap HB_COOL/HB_HEAT here."
   #define HB_COOL  HIGH
   #define HB_HEAT  LOW
 #else  // TARGET_REVA

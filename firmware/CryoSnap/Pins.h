@@ -93,7 +93,12 @@
   //   - Button Enable moves to D7 (was D8).
   //   - TPS_FAULT discrete input is removed entirely; the firmware's
   //     polled TPS STATUS read in task_100ms covers it.
-  //   - AREF tied to the 5 V SCL/SDA pull-up rail.
+  //   - AREF tied to the 3.3 V rail (op-amp NTC network reference;
+  //     see Config.h USE_EXTERNAL_AREF). Operator-verified
+  //     AREF = 3.3 V on the 2026-06-10 Rev B bring-up — NTC1 read
+  //     room temperature (23.3 C) which is only consistent with a
+  //     3.3 V reference; a 5 V AREF would have produced ~50% off
+  //     numbers via the firmware's linear NTC formula.
   #define HW_FAN_TACH       5     // T1 input — Timer1 hardware counter
   #define HW_FAN_PWM        3     // OC2B  — Timer2 hardware PWM
   #define HW_LED_DAT        4     // WS2812B chain

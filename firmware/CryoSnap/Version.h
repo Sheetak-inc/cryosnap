@@ -169,6 +169,21 @@
     re-enable during an active WAIT, fault-latch during WAIT,
     HAS_INA226 = 0 build, and MINIMAL_BUILD path.
 
+    Rev B bring-up (2026-06-10): boots clean on the first assembled
+    Rev B board. All four I2C peripherals enumerate at the expected
+    Rev B addresses (TPS55288 0x74, OLED 0x3C, INA226 0x40,
+    HUSB238 0x08). PD negotiates 20 V / 3250 mA. NTC1 reads
+    sensible room temperature (23.3 C). H-bridge polarity inherited
+    from Rev A is bench-confirmed correct: 200 mA Cool drive
+    produced a monotonic 1.00 C drop in Tcold over 47 s. Fan tach
+    on D5 reports 0 RPM (operator-confirmed fan is connected; the
+    new D5 net likely needs an external 10K pull-up to 5 V that the
+    Rev A board had on D2). All TEC tests in this session used
+    fan = 0 to suppress the FAULT[FAN] check. Not yet exercised on
+    Rev B: mid-current envelope (500 mA / 1 A), Seebeck SM polarity-
+    flip regression at sustained drive, HEAT-mode inverse polarity,
+    OLED render, button D7, mode pot, LED chain D4.
+
   0.7.10  2026-06-09  Soft-start I_limit ramp at the actuate layer
 
     Motivation: BUG-003 addendum bench evidence (logs/23.txt) showed

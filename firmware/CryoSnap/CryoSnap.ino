@@ -634,12 +634,6 @@ void setup() {
   Serial.println(F(" PROTO"));
 #elif BUILD_TARGET == TARGET_REVB
   Serial.println(F(" REVB"));
-#if ENABLE_VERBOSE_BOOT
-  // H-bridge polarity on Rev B is currently inherited from Rev A
-  // without bench verification — see HBridge.h. Print a loud warning
-  // at boot so the operator notices before trusting cooling commands.
-  Serial.println(F("WARN: REVB H-bridge polarity is unverified. Confirm cool/heat direction before relying on this build."));
-#endif
 #else
   Serial.println(F(" REVA"));
 #endif
