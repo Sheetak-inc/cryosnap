@@ -37,7 +37,7 @@ translation unit — the "open and compile" story stays trivial.
 |---|---|
 | `CryoSnap.ino` | Main story: setup, loop, fast/100 ms/1 s task buckets. Reads top-to-bottom. |
 | `Config.h` | All tunables: pins, defaults, safety limits, feature flags (`ENABLE_*`). The maker edits this to customize behavior. |
-| `Pins.h` | Board-target switch (`TARGET_PROTO` / `TARGET_REVA` / `TARGET_REVB`) exporting canonical `HW_*` pin names. |
+| `Pins.h` | Board-target switch (`TARGET_REVA` / `TARGET_REVB`) exporting canonical `HW_*` pin names. |
 | `Version.h` | Firmware version string + changelog. Bump on each release. |
 
 ### Control
@@ -189,11 +189,8 @@ operator runs `save` once.
 
 Set `BUILD_TARGET` in `Pins.h` (default is `TARGET_REVA`):
 
-- **`TARGET_PROTO`** — bench breadboard prototype. Uses the pin
-  values in Config.h, TPS55288 at I2C 0x75, inverted H-bridge
-  polarity.
 - **`TARGET_REVA`** — first-spin production PCB. Schematic-verified
-  pinout, TPS55288 at I2C 0x74, correct H-bridge polarity.
+  pinout, TPS55288 at I2C 0x74, H-bridge polarity bench-confirmed.
 - **`TARGET_REVB`** — next-spin production PCB. Same I2C address as
   Rev A but moves fan tach to D5 (Timer1 T1 input), INA Alert to D2,
   LED data to D4, and removes the discrete TPS fault pin (the chip
@@ -207,7 +204,7 @@ and I2C-scan default OFF):
 | Target | Flash | RAM |
 |---|---|---|
 | `TARGET_REVA` (default) | 30696 B / 99.9% (24 B free) | 805 B / 39% |
-| `TARGET_PROTO` / `TARGET_REVB` | within ~100 B of REVA | — |
+| `TARGET_REVB` | within ~100 B of REVA | — |
 | `MINIMAL_BUILD = 1` | ~22 KB / 71% | ~600 B / 29% |
 
 The default REVA build is tight against the Nano's 30720 B ceiling.

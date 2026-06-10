@@ -272,7 +272,15 @@ static void _cmd_execute(char* cmd) {
     Serial.print(F("Enable:")); Serial.println(g_enabled ? '1' : '0');
   }
   else if (MATCH("set", 3)) {
-    if (_has_arg(cmd + 3)) g_setpoint = atof(cmd + 3);
+    if (_has_arg(cmd + 3)) {
+      g_setpoint = atof(cmd + 3);
+      // Reset PID state so the integrator doesn't carry residual from
+      // the old setpoint into the new tracking window. Unconditional
+      // (rather than gated on delta != 0) is cheaper in flash and
+      // operationally harmless — a re-typed same-value `set` just
+      // restarts convergence from current temp.
+      _pid_full_reset();
+    }
     Serial.print(F("SP=")); Serial.println(g_setpoint, 1);
   }
   else if (MATCH("fan", 3)) {

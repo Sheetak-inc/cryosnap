@@ -24,7 +24,7 @@
               conditioned ADC inputs. Only cold-side drives control.
     Fan       4-wire fan — hardware PWM speed + tach pulse ISR.
 
-  See Pins.h for pin assignments (TARGET_PROTO vs TARGET_REVA) and
+  See Pins.h for pin assignments (TARGET_REVA vs TARGET_REVB) and
   Config.h for tunables (baud rate, safety limits, sense resistors).
 
   Code organization notes
@@ -630,9 +630,7 @@ void setup() {
   Serial.println();
   Serial.print(F("CryoSnap v"));
   Serial.print(F(FW_VERSION_STR));
-#if BUILD_TARGET == TARGET_PROTO
-  Serial.println(F(" PROTO"));
-#elif BUILD_TARGET == TARGET_REVB
+#if BUILD_TARGET == TARGET_REVB
   Serial.println(F(" REVB"));
 #else
   Serial.println(F(" REVA"));

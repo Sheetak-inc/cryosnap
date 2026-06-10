@@ -4,47 +4,16 @@
 #include <Arduino.h>
 
 // ============================================
-// Pin Definitions (Arduino Nano — bench prototype)
+// Arduino Nano fixed-function pins (informational)
 // ============================================
-
-// UART — hardware defaults
-// RX 0
-// TX 1
-
-// Fan Control
-#define PIN_FAN_TACH 2
-#define PIN_FAN_PWM  3
-
-// WS2812B LED chain
-#define PIN_LED_DAT  7
-
-// H-Bridge direction (DRV8701E PH pin, single GPIO)
-#define PIN_DIR      6
-
-// UI
-#define PIN_BUTTON_ENABLE 8  // needs internal pullup (active low, press = GND)
-
-// SPI — hardware defaults (OLED display, not in firmware scope)
-// MOSI 11
-// MISO 12
-// SCK  13
-
-// Error detection
-#define PIN_nFAULT_TPS55288 A0
-#define PIN_INA_ALERT       10   // INA226 alert output (polled, not ISR)
-
-// NTCs (op-amp conditioned ADC inputs)
-#define NTC_1 A1
-#define NTC_2 A2
-#define NTC_3 A3
-
-// I2C — hardware defaults
-// SDA: A4
-// SCL: A5
-
-// UI
-#define PIN_MODE_SWITCH A6
-#define PIN_POT         A7
+// UART (Serial):    RX = D0, TX = D1
+// SPI:              MOSI = D11, MISO = D12, SCK = D13
+// I2C:              SDA = A4,  SCL = A5
+//
+// All other pin assignments are board-target dependent and live in
+// Pins.h under the canonical HW_* names. The firmware always uses
+// HW_* — never raw pin numbers — so a board re-spin only requires
+// editing Pins.h.
 
 // ============================================
 // System Constants
@@ -63,7 +32,6 @@
 // Driver Hardware Constants
 // ============================================
 #define TPS_RSENSE   0.010f  // TPS55288 sense resistor, Ohms (10 mOhm)
-#define TPS_I2C_ADDR 0x75    // 0x75 on prototype, 0x74 on Rev A
 
 // INA226 shunt resistor.
 // With 10 mOhm: max measurable current = 81.92 mV / 10 mOhm = 8.19 A.
@@ -435,16 +403,16 @@
 #ifndef DEFAULT_FAN_SPEED
 #define DEFAULT_FAN_SPEED    180    // 0..255 PWM duty (180 ~ 70%)
 #endif
-// LED brightness scale, 0..255 (0 = off, 255 = full). 64 (~25%)
-// is comfortable indoors — the full-scale WS2812 chain is bright
-// enough to be uncomfortable on a bench desk. User-adjustable at
+// LED brightness scale, 0..255 (0 = off, 255 = full). 15 (~6%)
+// is comfortable for a bench-desk readout; the full-scale WS2812
+// chain is uncomfortably bright at close range. User-adjustable at
 // runtime via the `bright` serial command, persisted to EEPROM
 // via `save`.
 //
 // To change the default: edit the value here; existing EEPROM
 // settings retain their stored value until `defaults` is run.
 #ifndef DEFAULT_LED_BRIGHTNESS
-#define DEFAULT_LED_BRIGHTNESS  64
+#define DEFAULT_LED_BRIGHTNESS  15
 #endif
 #ifndef FAN_DISABLED_SPEED
 #define FAN_DISABLED_SPEED   127    // fan runs at ~50% even when TEC is off (passive cooling)

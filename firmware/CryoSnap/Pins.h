@@ -5,12 +5,7 @@
   Pins.h — board target selection.
 
   This is the one place that resolves *which* set of pin numbers the
-  firmware uses. Three targets are supported:
-
-    TARGET_PROTO  Bench prototype rig (Arduino Nano breadboard).
-                  Pin values come from Config.h. Most pins match
-                  the Rev A schematic — only the TPS55288 I2C
-                  address and the INA226 shunt resistor differ.
+  firmware uses. Two targets are supported:
 
     TARGET_REVA   First-spin production PCB (Arduino Nano).
                   Pin values are hard-coded here from the verified
@@ -28,7 +23,6 @@
   pin numbers — so a pin move only requires editing this file.
 */
 
-#define TARGET_PROTO  1
 #define TARGET_REVA   2
 #define TARGET_REVB   3
 
@@ -38,30 +32,7 @@
 
 #include "Config.h"
 
-#if BUILD_TARGET == TARGET_PROTO
-  // -- Bench prototype (Nano on a breadboard) ----------------------------
-  // Re-export Config.h symbols under canonical HW_* names. The
-  // prototype matches the Rev A pinout; only the TPS I2C address
-  // and INA shunt value differ (both live in Config.h).
-  #define HW_FAN_TACH       PIN_FAN_TACH       // D2  — INT0, fan tach ISR
-  #define HW_FAN_PWM        PIN_FAN_PWM        // D3  — OC2B, Timer2 HW PWM
-  #define HW_LED_DAT        PIN_LED_DAT        // D7  — WS2812B chain
-  #define HW_HB_DIR         PIN_DIR            // D6  — DRV8701E direction
-  #define HW_BUTTON_EN      PIN_BUTTON_ENABLE  // D8  — active low, internal pullup
-  #define HW_NTC_1          NTC_1              // A1
-  #define HW_NTC_2          NTC_2              // A2
-  #define HW_NTC_3          NTC_3              // A3
-  #define HW_MODE_SWITCH    PIN_MODE_SWITCH    // A6
-  #define HW_POT            PIN_POT            // A7
-  #define HW_TPS_FAULT      PIN_nFAULT_TPS55288 // A0
-  #define HW_INA_ALERT      PIN_INA_ALERT      // D10
-  #define HAS_INA226        1
-  #define HAS_HUSB238       1
-  #define HAS_TPS_FAULT     1
-  #define HAS_OLED          1                  // 0.91" SSD1306 on bench rig
-  #define I2C_ADDR_TPS55288 TPS_I2C_ADDR       // 0x75 per Config.h strap
-
-#elif BUILD_TARGET == TARGET_REVA
+#if BUILD_TARGET == TARGET_REVA
   // -- Production Rev A PCB -----------------------------------------------
   // Schematic-verified pinout. ATmega328P / Arduino Nano Classic.
   #define HW_FAN_TACH       2     // INT0  — fan tach ISR
@@ -117,7 +88,7 @@
   #define I2C_ADDR_TPS55288 0x74  // strap-selected on Rev B (same as Rev A)
 
 #else
-  #error "BUILD_TARGET must be TARGET_PROTO, TARGET_REVA, or TARGET_REVB"
+  #error "BUILD_TARGET must be TARGET_REVA or TARGET_REVB"
 #endif
 
 // Common I2C device addresses.

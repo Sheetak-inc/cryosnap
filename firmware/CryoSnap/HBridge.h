@@ -32,9 +32,9 @@
     hb_safeDirectionChange(dir) TPS off -> settle -> toggle -> TPS on
 */
 
-// H-bridge direction polarity. Bench-confirmed identical on all three
-// targets (LOW = drive toward Heat side, HIGH = drive toward Cool):
-//   PROTO   bench prototype
+// H-bridge direction polarity. Bench-confirmed identical on both
+// production targets (LOW = drive toward Heat side, HIGH = drive
+// toward Cool):
 //   Rev A   confirmed 2026-06-03 (BUG-000 in the audit log; the
 //           earlier comment claimed the opposite, which was wrong)
 //   Rev B   confirmed 2026-06-10 — 200 mA Cool drive on the first
@@ -42,10 +42,7 @@
 //           in Tcold over 47 s
 // If a future board build heats when commanded to cool, swap the
 // HB_COOL/HB_HEAT pair in the offending branch below.
-#if BUILD_TARGET == TARGET_PROTO
-  #define HB_COOL  HIGH
-  #define HB_HEAT  LOW
-#elif BUILD_TARGET == TARGET_REVB
+#if BUILD_TARGET == TARGET_REVB
   #define HB_COOL  HIGH
   #define HB_HEAT  LOW
 #else  // TARGET_REVA
