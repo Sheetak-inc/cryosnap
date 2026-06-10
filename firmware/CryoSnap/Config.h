@@ -139,9 +139,21 @@
 //       SOFT_START_RESET_GAP_MS below. V_limit is NOT ramped (a TEC
 //       is current-limited; V_limit is just a ceiling).
 //
-//   ENABLE_VERBOSE_BOOT       ~250 B flash
-//       Boot banner, EEPROM blank/loaded message, PD reinit
-//       chatter, init warnings. Off = silent boot, ready prompt.
+//   ENABLE_VERBOSE_BOOT       ~380 B flash
+//       EEPROM blank/loaded message, PD reinit chatter, init warnings,
+//       PD-budget echo. Off = silent boot. The version banner ("CryoSnap
+//       vX.Y.Z REVA") is emitted regardless of this flag because
+//       operator and log-parsing tools depend on it.
+//
+//   SEEBECK_HB_OFF_MAX_MS     ~290 B flash, 7 B RAM (when > 0)
+//       Non-blocking Seebeck wait state machine at the actuate layer:
+//       on detected polarity flip, drops OE, reads bus voltage as
+//       Seebeck-EMF proxy, waits proportional to measured EMF, then
+//       performs the H-bridge direction change. Mitigates the
+//       polarity-flip transient that couples Seebeck EMF + H-bridge
+//       inductive kickback into the TPS55288 EN/VCC pin at high ΔT.
+//       Tuning: SEEBECK_HB_OFF_BASE_MS / SETTLE_MS / PER_VOLT_MS /
+//       MAX_MS below. Setting MAX_MS=0 compiles the entire feature out.
 //
 //   ENABLE_SAFETY_FAULTS      ~600 B flash
 //       Master switch for the FOUR fault sources beyond OVERTEMP
@@ -213,6 +225,13 @@
   #define ENABLE_OLED_DISPLAY       0
   #define ENABLE_DIAGNOSTICS        0
   #define COMPACT_FAULT_MSGS        1
+  // SEEBECK_HB_OFF_MAX_MS=0 compiles the Seebeck wait state machine
+  // out entirely (~290 B flash, 7 B RAM). MINIMAL_BUILD targets ship-
+  // worthy firmware that has neither soft-start nor the polarity-flip
+  // mitigation; both Phase-5-class chip-wedge avoidance and inrush
+  // protection are sacrificed for footprint.
+  #define SEEBECK_HB_OFF_MAX_MS     0
+  #define ENABLE_SEEBECK_TRACE      0
 #endif
 
 #ifndef ENABLE_DEBUG_DUMP_REGS
@@ -222,7 +241,12 @@
 #define ENABLE_EEPROM_SETTINGS    1
 #endif
 #ifndef ENABLE_I2C_BOOT_SCAN
-#define ENABLE_I2C_BOOT_SCAN      1
+// Default OFF. Driver-specific WARN messages (WARN TPS, WARN INA,
+// WARN HUSB, WARN OLED) at boot already report missing chips by
+// name. The full bus walk is a bring-up convenience that costs
+// ~300 B flash. Override with -DENABLE_I2C_BOOT_SCAN=1 when an
+// unexpected device may be on the bus.
+#define ENABLE_I2C_BOOT_SCAN      0
 #endif
 #ifndef ENABLE_NTC_CALIBRATION
 #define ENABLE_NTC_CALIBRATION    1
@@ -278,8 +302,71 @@
 #ifndef SOFT_START_RESET_GAP_MS
 #define SOFT_START_RESET_GAP_MS   500
 #endif
+
+// Direction-change Seebeck mitigation (non-blocking state machine).
+// When the controller flips drive_dir, the actuate layer drops OE,
+// settles briefly so the TPS output cap equilibrates with the TEC's
+// Seebeck EMF (via the always-enabled DRV8701E H-bridge MOSFETs in
+// linear region — a near-zero-resistance bidirectional path between
+// the INA-side rail and the TEC terminals), READS the residual bus
+// voltage (= |Seebeck EMF| on the de-energised load to within a few
+// mV of MOSFET drop), then waits a measurement-scaled period before
+// re-asserting OE in the new direction. The wait length tracks
+// actual heat-removal conditions: a chilled-water-loop installation
+// keeps ΔT (and therefore Seebeck) small and gets the BASE wait
+// only; a poorly-heatsunk one accumulates large ΔT and gets up to
+// MAX_MS. Does not constrain fast temperature movements when the
+// customer's heat path can keep ΔT low.
+//   wait_ms = BASE_MS + V_seebeck * PER_VOLT_MS  (clamped to MAX_MS)
+//
+// SEEBECK_HB_OFF_BASE_MS — minimum wait per flip, applied even when
+//   measured Seebeck is ~0 V. 100 ms covers the chip's internal
+//   recovery period observed across the Phase-4 toggle sequence.
+//
+// SEEBECK_HB_OFF_SETTLE_MS — quiet period between OE-off and the
+//   INA bus voltage sample, so the TPS output cap equilibrates to
+//   Seebeck EMF via the H-bridge low-Rds path before measurement.
+//
+// SEEBECK_HB_OFF_PER_VOLT_MS — scaling factor from measured Seebeck
+//   voltage to additional wait. 1000 = 1 second of additional wait
+//   per volt of measured Seebeck.
+//
+// SEEBECK_HB_OFF_MAX_MS — clamp ceiling on the computed wait. Also
+//   acts as the feature kill switch: setting MAX_MS=0 compiles the
+//   state machine out entirely (polarity flips proceed without any
+//   mitigation, as in v0.7.10 and earlier).
+#ifndef SEEBECK_HB_OFF_BASE_MS
+#define SEEBECK_HB_OFF_BASE_MS    100
+#endif
+#ifndef SEEBECK_HB_OFF_SETTLE_MS
+#define SEEBECK_HB_OFF_SETTLE_MS   20
+#endif
+#ifndef SEEBECK_HB_OFF_PER_VOLT_MS
+#define SEEBECK_HB_OFF_PER_VOLT_MS 1000
+#endif
+#ifndef SEEBECK_HB_OFF_MAX_MS
+#define SEEBECK_HB_OFF_MAX_MS    3000
+#endif
+
+// Hysteresis floor: after a Seebeck wait completes, suppress new wait
+// triggers for this many ms. Aimed at the limit-cycle case (bang-bang
+// + Mode Auto, EEPROM-stale 0-deadband, etc.) where the controller
+// oscillates around setpoint and the SM would otherwise fire on every
+// crossing. Within the floor, any prior wait has just protected the
+// chip from polarity-flip stress, so a subsequent flip can proceed
+// without a fresh wait. Set to 0 to disable hysteresis.
+#ifndef SEEBECK_MIN_SAME_DIR_MS
+#define SEEBECK_MIN_SAME_DIR_MS   1000
+#endif
+
 #ifndef ENABLE_VERBOSE_BOOT
-#define ENABLE_VERBOSE_BOOT       1
+// Default OFF. EEPROM blank/loaded status, PD-reinit chatter, and
+// PD-budget echo are useful during bring-up but not in steady-state
+// operation. The version banner stays emitted regardless (see the
+// banner block in setup()) so operator and log-parsing tools can
+// still identify the running build. Override with
+// -DENABLE_VERBOSE_BOOT=1 on a flash-budget-rich build.
+#define ENABLE_VERBOSE_BOOT       0
 #endif
 #ifndef ENABLE_SAFETY_FAULTS
 #define ENABLE_SAFETY_FAULTS      1
@@ -299,6 +386,15 @@
 #endif
 #ifndef ENABLE_DIAGNOSTICS
 #define ENABLE_DIAGNOSTICS        1
+#endif
+
+#ifndef ENABLE_SEEBECK_TRACE
+// Default ON when diagnostics are on. Emits a `DIAG: Seebeck V=x.xx
+// wait=NNNNms` line at each polarity-flip wait calculation, then a
+// `DIAG: Seebeck t V=x.xx` line every 100 ms tick during the wait
+// so the EMF decay curve is visible in the serial log. ~150 B flash.
+// Set to 0 in flash-tight builds; auto-zeroed under MINIMAL_BUILD.
+#define ENABLE_SEEBECK_TRACE      ENABLE_DIAGNOSTICS
 #endif
 #ifndef COMPACT_FAULT_MSGS
 #define COMPACT_FAULT_MSGS        0

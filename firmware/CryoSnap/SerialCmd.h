@@ -262,6 +262,12 @@ static void _cmd_execute(char* cmd) {
 #if ENABLE_SOFT_START
       _ramp_armed = true;       // arm I_limit ramp; consumed at first actuating tick
 #endif
+#if SEEBECK_HB_OFF_MAX_MS > 0
+      _have_last_dir = false;   // mirror button-enable path
+#if SEEBECK_MIN_SAME_DIR_MS > 0
+      _seebeck_last_done_ms = 0;
+#endif
+#endif
     }
     Serial.print(F("Enable:")); Serial.println(g_enabled ? '1' : '0');
   }
