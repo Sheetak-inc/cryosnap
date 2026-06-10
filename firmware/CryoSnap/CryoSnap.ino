@@ -53,21 +53,24 @@
     1 s slow task
       status summary, HUSB238 PD re-poll, optional diagnostics
 
-  Example boot output
-  -------------------
-    CryoSnap -- boot
-    Build target: PROTO (bench prototype)
+  Example boot output (default build — ENABLE_VERBOSE_BOOT and
+  ENABLE_I2C_BOOT_SCAN both default to 0; the version banner is
+  emitted regardless of those flags)
+  ---------------------------------
+    CryoSnap v0.7.11 REVA
+    HUSB238: 20V but only 3250 mA, renegotiating...
+    HUSB238: after renegotiation: 20V / 3250 mA
+
+  Send "status" over serial to see the full register / sensor /
+  control-state snapshot at any time. With
+  -DENABLE_VERBOSE_BOOT=1 -DENABLE_I2C_BOOT_SCAN=1 the boot also
+  prints an I2C bus walk:
     I2C scan starting...
-      found 0x22  (HUSB238)
+      found 0x08  (HUSB238)
       found 0x3C  (OLED SSD1306)
       found 0x40  (INA226)
       found 0x75  (TPS55288)
     I2C scan done: 4 device(s) responded.
-    HUSB238: tried 20V, got 20V
-    --- status ---
-    PD     : 20 V / 3250 mA
-    INA226 : V=0.000 V  I=0.000 A  P=0.000 W
-    --------------
     --- registers ---
     TPS55288 (0x75):
       VREF_L     = 0xBF
@@ -259,6 +262,48 @@ static unsigned long _ramp_start_ms    = 0;
 static unsigned long _last_actuate_ms  = 0;
 #endif
 
+// Non-blocking Seebeck wait state machine. Tunables live in Config.h
+// (SEEBECK_HB_OFF_BASE_MS / SETTLE_MS / PER_VOLT_MS / MAX_MS); the
+// state machine logic lives in task_100ms below.
+//
+// State machine lives across task_100ms ticks so the scheduler stays
+// cooperative: operator commands, fault polls, fan tach, OLED, and
+// INA/HUSB monitors all keep their cadence during the up-to-MAX_MS
+// wait. Compare to a blocking delay(), which would stall every other
+// task until the wait completes.
+//
+//   SB_IDLE          — no wait active; actuate runs normally.
+//   SB_OE_OFF_SETTLE — OE off, waiting SETTLE_MS for the output cap
+//                      to equilibrate with the TEC's Seebeck EMF via
+//                      the H-bridge body diodes before we sample INA.
+//   SB_OE_OFF_WAIT   — sampled Seebeck once, deadline pushed forward
+//                      by the measured-EMF-scaled wait; the polarity
+//                      flip happens when this expires.
+//
+// _have_last_dir is an explicit bool rather than a sentinel-value
+// inside _last_drive_dir_exp, so the HB direction-value space stays
+// free for future Rev B pin remapping.
+#if SEEBECK_HB_OFF_MAX_MS > 0
+#define SB_IDLE           0
+#define SB_OE_OFF_SETTLE  1
+#define SB_OE_OFF_WAIT    2
+static uint8_t        _seebeck_state      = SB_IDLE;
+static unsigned long  _seebeck_deadline   = 0;
+static uint8_t        _last_drive_dir_exp = 0;
+static bool           _have_last_dir      = false;
+#if SEEBECK_MIN_SAME_DIR_MS > 0
+// Timestamp of the previous WAIT->IDLE transition. The SM trigger
+// (in SB_IDLE) refuses to re-arm within SEEBECK_MIN_SAME_DIR_MS of
+// this timestamp; suppresses limit-cycle flip noise from a controller
+// that oscillates around setpoint (bang-bang + Mode Auto being the
+// pathological case — engagement-internal bench evidence in the
+// seebeck_mode_controller report). _have_last_dir gates the first-
+// flip-after-boot case independently, so the initial 0 value here
+// has no observable effect at boot.
+static unsigned long  _seebeck_last_done_ms = 0;
+#endif
+#endif
+
 // ---- USB-PD power budget ------------------------------------------------
 // Computed at boot from the HUSB238 negotiated voltage and current.
 // The control task must not allow INA226 measured power to exceed this.
@@ -447,6 +492,19 @@ static void _tps_only_recover() {
   // BUG-003 Phase-5 inrush at the moment soft-start matters most.
   _ramp_armed = true;
 #endif
+#if SEEBECK_HB_OFF_MAX_MS > 0
+  // Reset Seebeck SM bookkeeping so the next post-recovery polarity
+  // flip gets a fresh wait. Without this, _have_last_dir would
+  // still hold the pre-recovery direction (matched against current
+  // drive_dir as if nothing happened), and the SEEBECK_MIN_SAME_DIR_MS
+  // floor would suppress the very flip the wait was designed to
+  // protect (the first drive after a chip reset is exactly when the
+  // EN/VCC pin is most vulnerable).
+  _have_last_dir = false;
+#if SEEBECK_MIN_SAME_DIR_MS > 0
+  _seebeck_last_done_ms = 0;
+#endif
+#endif
 }
 
 static void _pd_reinit() {
@@ -563,7 +621,9 @@ void setup() {
   // Skip the wait if Serial isn't going to be available within ~2 s.
   while (!Serial && millis() < 2000) { /* spin */ }
 
-#if ENABLE_VERBOSE_BOOT
+  // Version banner — always emitted (NOT gated by ENABLE_VERBOSE_BOOT)
+  // because operator + log-parsing tools (e.g. cryosnap_monitor) need
+  // it to identify the running build.
   Serial.println();
   Serial.print(F("CryoSnap v"));
   Serial.print(F(FW_VERSION_STR));
@@ -571,14 +631,14 @@ void setup() {
   Serial.println(F(" PROTO"));
 #elif BUILD_TARGET == TARGET_REVB
   Serial.println(F(" REVB"));
+#if ENABLE_VERBOSE_BOOT
   // H-bridge polarity on Rev B is currently inherited from Rev A
-  // without bench verification — see HBridge.h. Print a loud
-  // warning at boot so the operator notices before they trust
-  // cooling commands on an un-validated board.
+  // without bench verification — see HBridge.h. Print a loud warning
+  // at boot so the operator notices before trusting cooling commands.
   Serial.println(F("WARN: REVB H-bridge polarity is unverified. Confirm cool/heat direction before relying on this build."));
+#endif
 #else
   Serial.println(F(" REVA"));
-#endif
 #endif
 
   // LEDs first so the maker has a visible "I'm alive" cue even if a
@@ -745,6 +805,20 @@ void loop() {
               ctrl_on_enable();        // kick off armed schedule, if any
 #if ENABLE_SOFT_START
               _ramp_armed = true;      // arm I_limit ramp; consumed at first actuating tick
+#endif
+#if SEEBECK_HB_OFF_MAX_MS > 0
+              // Clear Seebeck direction history + hysteresis floor.
+              // The FAULT_GRACE_MS gate on the state machine also
+              // covers _have_last_dir during the first 3 s, but the
+              // explicit clear keeps the invariant "every state-loss
+              // event (operator enable, chip recovery, etc.) resets
+              // all SM bookkeeping" symmetric and easy to reason
+              // about. Zero flash for the immediate-zero stores
+              // (avr-gcc folds them).
+              _have_last_dir = false;
+#if SEEBECK_MIN_SAME_DIR_MS > 0
+              _seebeck_last_done_ms = 0;
+#endif
 #endif
             }
             Serial.print(F("Enable: "));
@@ -1325,6 +1399,137 @@ static void task_100ms() {
   // direction flip under clamp is still safer with the standard
   // sequence (TPS off -> settle -> toggle -> TPS on).
 
+  // Seebeck mitigation, non-blocking state machine.
+  //   (1) on detected direction-change, tps_setOutput(false), enter SETTLE
+  //   (2) SETTLE_MS later: read INA bus voltage — this is the Seebeck
+  //       EMF minus one body-diode drop when |Seebeck| > ~0.6 V; below
+  //       that the bus reads ~0 V which correctly maps to BASE_MS
+  //   (3) WAIT for BASE + V_meas * PER_V (clamped to MAX_MS) so the
+  //       polarity flip happens after the EMF has decayed enough to
+  //       avoid punching the TPS EN/VCC pin
+  // Does NOT key on setpoint magnitude — heat-removal quality varies
+  // (chilled-water loop vs poor heatsink); a customer with great heat
+  // removal sees only the BASE_MS blip even on a large setpoint swing.
+  // Cooperative across ticks (was a blocking delay() in the v0.7.11
+  // first-draft, which broke BUG-008 PID dt accounting, burned
+  // FAULT_GRACE_MS, blocked operator-emergency-off for up to 3 s,
+  // and starved task_slow). Gated outside FAULT_GRACE_MS so a first-
+  // tick flip cannot consume the grace window inside the wait.
+#if SEEBECK_HB_OFF_MAX_MS > 0
+  {
+    unsigned long now_ms = millis();
+    switch (_seebeck_state) {
+      case SB_OE_OFF_SETTLE:
+        if ((long)(now_ms - _seebeck_deadline) >= 0) {
+          // ina_readVoltageV scales an unsigned LSB — always >= 0,
+          // no abs() needed (verified in INA226.h:168-172).
+          float v_meas = ina_readVoltageV();
+          uint32_t scaled_ms = (uint32_t)(v_meas * SEEBECK_HB_OFF_PER_VOLT_MS);
+          uint32_t wait_ms   = SEEBECK_HB_OFF_BASE_MS + scaled_ms;
+          if (wait_ms > SEEBECK_HB_OFF_MAX_MS) wait_ms = SEEBECK_HB_OFF_MAX_MS;
+          _seebeck_deadline = now_ms + wait_ms;
+          _seebeck_state    = SB_OE_OFF_WAIT;
+#if ENABLE_SEEBECK_TRACE
+          Serial.print(F("DIAG: Seebeck V="));
+          Serial.print(v_meas, 2);
+          Serial.print(F(" wait="));
+          Serial.print(wait_ms);
+          Serial.println(F("ms"));
+#endif
+        }
+        break;
+      case SB_OE_OFF_WAIT:
+#if ENABLE_SEEBECK_TRACE
+        {
+          // Per-tick EMF trace so the decay curve is visible in the
+          // serial log. INA is on a different I2C address from TPS;
+          // sampling it during the wait does not perturb the recovery.
+          Serial.print(F("DIAG: Seebeck t V="));
+          Serial.println(ina_readVoltageV(), 2);
+        }
+#endif
+        if ((long)(now_ms - _seebeck_deadline) >= 0) {
+#if SEEBECK_MIN_SAME_DIR_MS > 0
+          _seebeck_last_done_ms = now_ms;      // start hysteresis floor
+#endif
+          _seebeck_state   = SB_IDLE;          // actuate runs this tick
+          // BUG-008 protection: next pid_compute would otherwise see
+          // ~wait_ms as one giant dt, get clamped to 0.5 s, and 5x-
+          // oversize its integrator step. Sentinel = 0 → first-call
+          // fallback at line ~1287 uses LOOP_INTERVAL_MS for one tick.
+          _pid_last_ms = 0;
+#if ENABLE_SOFT_START
+          // Suppress soft-start gap-based re-arm. A polarity flip on
+          // the same TEC is not an inrush event (same load, opposite
+          // polarity), so the ramp should NOT fire here. Without this
+          // the gap check would re-arm and the controller would see
+          // a sluggish step response post-flip.
+          _last_actuate_ms = now_ms;
+#endif
+          // Record new direction so the SB_IDLE history-update below
+          // does not re-trigger the state machine on this same tick.
+          if (tec_on) {
+            _last_drive_dir_exp = drive_dir;
+            _have_last_dir      = true;
+          }
+        }
+        break;
+      case SB_IDLE:
+      default:
+        // Detect direction-change → enter SETTLE. Triggers only when:
+        //   - controller actually wants to drive this tick (tec_on),
+        //   - we have a recorded prior driving direction,
+        //   - new direction differs from the recorded one,
+        //   - we are past FAULT_GRACE_MS — without this a first-tick
+        //     flip burns the grace window inside the wait and a
+        //     spurious FAULT[FAN] / FAULT[NOPSU] latches next tick,
+        //   - we are past the SEEBECK_MIN_SAME_DIR_MS hysteresis
+        //     floor since the last wait completed — suppresses
+        //     limit-cycle flip noise (a controller oscillating around
+        //     setpoint after the previous wait has already protected
+        //     against the polarity-flip transient; firing again
+        //     within ~1 s adds OE-off duty cycle without safety
+        //     benefit).
+        if (tec_on
+            && _have_last_dir
+            && drive_dir != _last_drive_dir_exp
+            && (now_ms - _enable_time) > FAULT_GRACE_MS
+#if SEEBECK_MIN_SAME_DIR_MS > 0
+            && (now_ms - _seebeck_last_done_ms) > SEEBECK_MIN_SAME_DIR_MS
+#endif
+            ) {
+          // OE-off NACK: chip is still driving in the OLD direction.
+          // Sampling INA at +20 ms would give the regulated output
+          // (5-15 V), not Seebeck — wait_ms would saturate to MAX
+          // and the TEC would be driven the wrong way for the full
+          // freeze. Skip the dance on NACK; normal actuate retries
+          // and its NACKs accumulate _tps_write_nack_count.
+          if (tps_setOutput(false)) {
+            _seebeck_deadline      = now_ms + SEEBECK_HB_OFF_SETTLE_MS;
+            _seebeck_state         = SB_OE_OFF_SETTLE;
+            _tried_drive_last_tick = false;  // chip is OE-off during wait
+          }
+        }
+        // Record current direction only on active-drive ticks.
+        // A deadband tick leaves drive_dir at its default (HB_COOL),
+        // which would corrupt history and trigger a spurious wait on
+        // the next active drive (dominant user-visible misbehaviour
+        // of the v0.7.11 first-draft near setpoint).
+        if (tec_on) {
+          _last_drive_dir_exp = drive_dir;
+          _have_last_dir      = true;
+        }
+        break;
+    }
+    // Safety: if g_enabled went false (operator off or fault latch)
+    // while we were waiting, drop the state so the else-branch below
+    // can run normal disable cleanup. The chip is already OE-off from
+    // the SETTLE entry, so no additional write is needed here.
+    if (!g_enabled) _seebeck_state = SB_IDLE;
+  }
+  if (_seebeck_state == SB_IDLE)
+#endif
+  {
   if (tec_on) {
     // Track whether the V/I writes actually landed. If they NACK
     // (marginal Vin during high-current drive), the chip is still
@@ -1427,6 +1632,8 @@ static void task_100ms() {
     // success paths (a writes_ok=true actuate tick, or a
     // _tps_only_recover success leg) drop it back to zero.
   }
+  }  // _seebeck_state == SB_IDLE — when non-IDLE, the chip is OE-off
+     // and actuate writes are suppressed until the wait deadline elapses.
 
   // Fan runs at the configured speed when enabled. When disabled, it
   // still spins at FAN_DISABLED_SPEED for passive cooling — this

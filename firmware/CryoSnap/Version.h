@@ -4,11 +4,167 @@
 // Firmware version — update on each meaningful change.
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  10
-#define FW_VERSION_STR    "0.7.10"
+#define FW_VERSION_PATCH  11
+#define FW_VERSION_STR    "0.7.11"
 
 /*
   Changelog (newest first):
+
+  0.7.11  Seebeck-measure-and-adjust, non-blocking state machine
+
+    Observed symptom: under sustained high-current cooling followed
+    by a controller-commanded polarity flip at large ΔT, the TPS55288
+    intermittently locked up — registers reset to defaults, chip
+    silent on I2C, recovery only via power cycle. Bench reproduction
+    (test_nopsu.py Phase 5, v0.7.10 baseline) showed 3 lock-up
+    events per run, 5/5 runs.
+
+    Mechanism: at the moment of polarity reversal, the TEC's
+    accumulated Seebeck EMF (α·ΔT, observed ~2 V at Phase-5-class
+    ΔT≈40 K) combines with H-bridge body-diode kickback during the
+    few-microsecond PIN_DIR transition. The combined transient
+    couples into the TPS55288's EN/VCC pin and triggers its
+    EN-shutdown protection. The v0.7.10 soft-start ramp limits
+    steady-state CURRENT but does not address the TRANSIENT.
+
+    Approach (rejected variants — preserved here so future work
+    does not re-tread the same paths):
+
+      No mitigation (v0.7.10 baseline):  5/5 runs, 3 lock-ups per run
+      Active V_limit discharge to 1V:    0 lock-ups but 3 FAULT[SCP]
+                                          in Phase 3 from chip-side
+                                          OVP-discharge inrush
+      Active V_limit discharge to 5V:    gentler but still 2 SCP /
+                                          1 lock-up
+      Passive OE-off 150/500 ms:         no SCP, no Phase-5 fix
+      Passive OE-off 1000 ms:            partial (2 runs: 0 then 2
+                                          lock-ups)
+      Passive OE-off 2000 ms (fixed):    3/3 runs, 0 lock-ups, 0 SCP
+      INA-polled V<2500 mV early-exit:   0/3 (fails: bus settles in
+                                          <500 ms but the chip needs
+                                          longer internal recovery)
+      Setpoint-magnitude scaled wait:    3/3 runs, 0 lock-ups
+      Seebeck-MEASURED wait (shipping):  3/3 runs, 0 lock-ups
+                                          (CDC=0xE0 resets: 1/0/2,
+                                          all self-recovered within
+                                          the same Phase-4 toggle
+                                          window)
+
+    Setpoint magnitude was rejected as a proxy because heat-removal
+    quality varies across deployments. A TEC on a chilled-water loop
+    keeps ΔT (and therefore Seebeck) small even on a large setpoint
+    swing and should not be made to wait; a poorly-heatsunk one
+    accumulates large ΔT even on a small swing and needs the full
+    mitigation. Measuring Seebeck directly tracks the actual
+    physical condition.
+
+    Design: a non-blocking state machine living across task_100ms
+    ticks (SB_IDLE → SB_OE_OFF_SETTLE → SB_OE_OFF_WAIT → SB_IDLE).
+    On a detected drive_dir change while tec_on, after FAULT_GRACE_MS
+    has elapsed since enable:
+
+      (1) tps_setOutput(false), record SETTLE deadline (now+20 ms),
+          enter SB_OE_OFF_SETTLE. If the OE-off write NACKs the
+          chip is still driving in the old direction; skip the state
+          machine entirely and let normal actuate retry (its NACKs
+          accumulate toward FAULT[NOPSU] through the existing path).
+
+      (2) SETTLE deadline elapses → read INA bus voltage. With OE
+          off, the bus is connected to the TEC only through the
+          H-bridge body diodes, so the reading approximates the
+          Seebeck EMF (minus one body-diode drop when |Seebeck| >
+          ~0.6 V; below that threshold the bus reads ~0 V, which
+          correctly maps to BASE_MS). Compute
+          wait_ms = SEEBECK_HB_OFF_BASE_MS +
+                    V_meas * SEEBECK_HB_OFF_PER_VOLT_MS
+          clamped to SEEBECK_HB_OFF_MAX_MS. Push the deadline
+          forward, enter SB_OE_OFF_WAIT.
+
+      (3) WAIT deadline elapses → return to SB_IDLE; actuate runs
+          this tick in the new direction. Reset _pid_last_ms = 0 so
+          the next pid_compute treats the wait as one nominal tick
+          of dt (the existing first-call fallback) instead of the
+          wait's full duration clamped at 0.5 s — without this the
+          integrator would take a 5x-oversized step on the post-flip
+          tick (BUG-008 regression protection). Update
+          _last_actuate_ms so the soft-start gap-based re-arm does
+          not fire on the post-WAIT tick — a polarity flip on the
+          same TEC is not an inrush event (same load, opposite
+          polarity), so the ramp deliberately is NOT applied here.
+          Record the new direction so this tick's drive does not
+          re-trigger the state machine via the immediate fall-
+          through into actuate.
+
+    The gate `if (_seebeck_state == SB_IDLE)` wraps the entire
+    actuate write block, so during SETTLE and WAIT no V/I/dir/OE
+    writes happen. The rest of task_100ms — fault polls, fan PWM,
+    LEDs, operator command pump, INA / HUSB monitors — continues
+    running every tick. Operator emergency-off (button or serial)
+    is honoured within one scheduler tick (~100 ms).
+
+    History gating: _last_drive_dir_exp only updates on ticks where
+    tec_on is true. Deadband ticks leave drive_dir at its default
+    HB_COOL, so without the gate a HEAT-driving tick followed by a
+    deadband tick would stamp history as COOL and trigger a spurious
+    100–3000 ms wait on the next active drive. _have_last_dir
+    (explicit bool, not a sentinel inside the direction value) is
+    cleared on the operator-enable rising edge (both the button
+    handler and the serial enable command) so first-actuate after
+    fault recovery does not compare against pre-fault history.
+
+    Grace-window gate: the state machine only fires after
+    FAULT_GRACE_MS has elapsed since enable. Without this gate a
+    first-tick flip could consume the entire 3 s grace window
+    inside the wait, preventing task_slow's first fan-tach poll
+    from running and producing a spurious FAULT[FAN] on the
+    following tick.
+
+    Tuning: SEEBECK_HB_OFF_BASE_MS (100 ms), SEEBECK_HB_OFF_SETTLE_MS
+    (20 ms), SEEBECK_HB_OFF_PER_VOLT_MS (1000 ms / V),
+    SEEBECK_HB_OFF_MAX_MS (3000 ms). Defaults map a measured 2 V
+    Seebeck to a 2100 ms wait and a 0.1 V Seebeck to a 200 ms blip.
+    Setting SEEBECK_HB_OFF_MAX_MS = 0 compiles the state machine
+    out entirely (polarity flips proceed as in v0.7.10).
+
+    Hysteresis floor: SEEBECK_MIN_SAME_DIR_MS (default 1000 ms). After
+    a wait completes the SM refuses to re-arm for this many ms. Aimed
+    at limit-cycle oscillation in bang-bang + Mode Auto: a controller
+    that flips direction every few seconds around setpoint would
+    otherwise force a fresh wait on every crossing. The prior wait has
+    already protected the chip from polarity-flip stress, so a flip
+    within the floor proceeds without a fresh wait. Set to 0 to
+    disable. All five knobs live in Config.h alongside SOFT_START_*.
+
+    Build cost: ~290 B flash and 7 B RAM for the non-blocking SM;
+    SF#3 hysteresis floor adds ~60 B flash and 4 B RAM; trace lines
+    (ENABLE_SEEBECK_TRACE, on by default when ENABLE_DIAGNOSTICS=1)
+    add another ~150 B flash for the operator-facing `DIAG: Seebeck
+    V=...` decay log; symmetric history-and-floor clears on every
+    state-loss event (operator enable, button enable, chip recovery)
+    add another ~50 B for the invariant "one clear per state-loss
+    event". ENABLE_I2C_BOOT_SCAN and ENABLE_VERBOSE_BOOT default
+    OFF in this revision so the build clears the Nano's 30720 B
+    ceiling. Driver-specific WARN messages at boot (WARN TPS / INA /
+    HUSB / OLED) report missing chips by name, so the full bus walk
+    is a bring-up convenience rather than a production requirement.
+    The version banner is emitted regardless of ENABLE_VERBOSE_BOOT
+    so operator and log-parsing tools can still identify the running
+    build. Final size: 30696 / 30720 B (99.9 %, 24 B free). The
+    next feature on this branch must reclaim flash before adding
+    code — see Config.h ENABLE_* flags or set ENABLE_SEEBECK_TRACE=0
+    (~150 B), ENABLE_DIAGNOSTICS=0 (~500 B), or
+    SEEBECK_MIN_SAME_DIR_MS=0 (~60 B) to recover headroom.
+
+    Caveat: this is a firmware-side mitigation. The underlying
+    hardware coupling (Seebeck EMF + H-bridge inductive kickback →
+    EN/VCC transient) remains. A future hardware revision should
+    add a TVS clamp on the TPS output or move to a driver with
+    less-sensitive SCP / EN protection.
+
+    Known untested paths in this revision (no Phase-5-class regression
+    expected, but worth a bench check on the next opportunity):
+    re-enable during an active WAIT, fault-latch during WAIT,
+    HAS_INA226 = 0 build, and MINIMAL_BUILD path.
 
   0.7.10  2026-06-09  Soft-start I_limit ramp at the actuate layer
 
