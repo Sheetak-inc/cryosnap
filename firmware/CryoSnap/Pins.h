@@ -52,6 +52,12 @@
   #define HAS_TPS_FAULT     1
   #define HAS_OLED          1
   #define I2C_ADDR_TPS55288 0x74  // strap-selected on Rev A
+  // Seebeck polarity-flip mitigation recipe (see Config.h). Rev A keeps
+  // the legacy OE-off measured-wait: the Rev A cap/bridge topology
+  // tolerates the brief dead-rail dwell (validated on the Rev A rig).
+  #ifndef SEEBECK_POWERED_FLIP
+  #define SEEBECK_POWERED_FLIP 0
+  #endif
 
 #elif BUILD_TARGET == TARGET_REVB
   // -- Production Rev B PCB -----------------------------------------------
@@ -86,9 +92,23 @@
   #define HAS_TPS_FAULT     0     // no discrete fault line on Rev B
   #define HAS_OLED          1
   #define I2C_ADDR_TPS55288 0x74  // strap-selected on Rev B (same as Rev A)
+  // Seebeck polarity-flip mitigation recipe (see Config.h). Rev B uses
+  // the LOW-V powered flip: an OE-off dwell drives the reversed Seebeck
+  // EMF below ground and wedges the TPS off the I2C bus (bench: 54/54
+  // kills), so the converter must stay POWERED through the reversal.
+  #ifndef SEEBECK_POWERED_FLIP
+  #define SEEBECK_POWERED_FLIP 1
+  #endif
 
 #else
   #error "BUILD_TARGET must be TARGET_REVA or TARGET_REVB"
+#endif
+
+// Fallback for an unknown BUILD_TARGET (or a -D override): the legacy
+// OE-off path is the safe default for a board whose flip behaviour
+// has not been characterised.
+#ifndef SEEBECK_POWERED_FLIP
+#define SEEBECK_POWERED_FLIP 0
 #endif
 
 // Common I2C device addresses.

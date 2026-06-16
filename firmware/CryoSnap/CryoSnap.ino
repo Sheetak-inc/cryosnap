@@ -262,16 +262,26 @@ static unsigned long _ramp_start_ms    = 0;
 static unsigned long _last_actuate_ms  = 0;
 #endif
 
-// Non-blocking Seebeck wait state machine. Tunables live in Config.h
-// (SEEBECK_HB_OFF_BASE_MS / SETTLE_MS / PER_VOLT_MS / MAX_MS); the
-// state machine logic lives in task_100ms below.
+// Non-blocking Seebeck polarity-flip mitigation state machine. Two
+// mutually-exclusive recipes select at compile time (SEEBECK_POWERED_FLIP
+// resolves per target in Pins.h); tunables live in Config.h. The SM
+// logic lives in task_100ms below.
 //
-// State machine lives across task_100ms ticks so the scheduler stays
+// The SM lives across task_100ms ticks so the scheduler stays
 // cooperative: operator commands, fault polls, fan tach, OLED, and
-// INA/HUSB monitors all keep their cadence during the up-to-MAX_MS
-// wait. Compare to a blocking delay(), which would stall every other
-// task until the wait completes.
+// INA/HUSB monitors all keep their cadence during the wait. Compare to
+// a blocking delay(), which would stall every other task.
 //
+// SEEBECK_POWERED_FLIP=1 (Rev B) — LOW-V powered flip; OE never drops:
+//   SB_IDLE        — no flip active; actuate runs normally.
+//   SB_LOWV_SETTLE — V/I floored in the OLD direction (OE on), waiting
+//                    SEEBECK_LOWV_SETTLE_MS for the rail/current to fall
+//                    to the floor before the live toggle.
+//   SB_LOWV_DWELL  — bridge FLIPPED to the new direction at the floor,
+//                    dwelling SEEBECK_LOWV_DWELL_MS before actuate ramps
+//                    back to full.
+//
+// SEEBECK_POWERED_FLIP=0 (Rev A) — legacy OE-off measured-wait:
 //   SB_IDLE          — no wait active; actuate runs normally.
 //   SB_OE_OFF_SETTLE — OE off, waiting SETTLE_MS for the TPS output
 //                      cap to equilibrate with the TEC's Seebeck EMF
@@ -286,10 +296,15 @@ static unsigned long _last_actuate_ms  = 0;
 // _have_last_dir is an explicit bool rather than a sentinel-value
 // inside _last_drive_dir_exp, so the HB direction-value space stays
 // free for future Rev B pin remapping.
-#if SEEBECK_HB_OFF_MAX_MS > 0
+#if SEEBECK_SM_ACTIVE
 #define SB_IDLE           0
+#if SEEBECK_POWERED_FLIP
+#define SB_LOWV_SETTLE    1   // floored, OLD dir, waiting to flip
+#define SB_LOWV_DWELL     2   // flipped, NEW dir, dwelling before ramp-up
+#else
 #define SB_OE_OFF_SETTLE  1
 #define SB_OE_OFF_WAIT    2
+#endif
 static uint8_t        _seebeck_state      = SB_IDLE;
 static unsigned long  _seebeck_deadline   = 0;
 static uint8_t        _last_drive_dir_exp = 0;
@@ -495,14 +510,18 @@ static void _tps_only_recover() {
   // BUG-003 Phase-5 inrush at the moment soft-start matters most.
   _ramp_armed = true;
 #endif
-#if SEEBECK_HB_OFF_MAX_MS > 0
+#if SEEBECK_SM_ACTIVE
   // Reset Seebeck SM bookkeeping so the next post-recovery polarity
   // flip gets a fresh wait. Without this, _have_last_dir would
   // still hold the pre-recovery direction (matched against current
   // drive_dir as if nothing happened), and the SEEBECK_MIN_SAME_DIR_MS
   // floor would suppress the very flip the wait was designed to
   // protect (the first drive after a chip reset is exactly when the
-  // EN/VCC pin is most vulnerable).
+  // EN/VCC pin is most vulnerable). Also abort any in-progress flip:
+  // tps_init() just reset the chip (V/I defaulted, OE dropped), so a
+  // half-completed LOW-V flip must restart from IDLE rather than
+  // resume a stale SETTLE/DWELL deadline against a freshly-reset chip.
+  _seebeck_state = SB_IDLE;
   _have_last_dir = false;
 #if SEEBECK_MIN_SAME_DIR_MS > 0
   _seebeck_last_done_ms = 0;
@@ -801,7 +820,7 @@ void loop() {
 #if ENABLE_SOFT_START
               _ramp_armed = true;      // arm I_limit ramp; consumed at first actuating tick
 #endif
-#if SEEBECK_HB_OFF_MAX_MS > 0
+#if SEEBECK_SM_ACTIVE
               // Clear Seebeck direction history + hysteresis floor.
               // The FAULT_GRACE_MS gate on the state machine also
               // covers _have_last_dir during the first 3 s, but the
@@ -1390,11 +1409,41 @@ static void task_100ms() {
   // reduced values and we want them to stick. Previously this
   // block always re-wrote the full drive_mA / g_vmax_mV, which
   // defeated the clamp entirely (BUG-004 / C-1 in the 2026-06-03
-  // audit log). hb_safeDirectionChange still runs because a
-  // direction flip under clamp is still safer with the standard
-  // sequence (TPS off -> settle -> toggle -> TPS on).
+  // audit log). A direction flip still runs under clamp: on Rev A via
+  // hb_safeDirectionChange (the standard OE off -> settle -> toggle ->
+  // on sequence); on Rev B via a LIVE hb_setDirection (OE stays on),
+  // because the OE-off sequence with a Seebeck gradient present is the
+  // Rev B dead-rail kill — see the actuate flip below and the M2 note.
 
-  // Seebeck mitigation, non-blocking state machine.
+  // Seebeck mitigation, non-blocking state machine. Two mutually-
+  // exclusive recipes select at compile time (SEEBECK_POWERED_FLIP
+  // resolves per target in Pins.h).
+  //
+  // SEEBECK_POWERED_FLIP=1 (Rev B): the LOW-V powered flip. Keep OE ON
+  // throughout; drop to the V/I floor, flip LIVE, dwell, then ramp.
+  //   (1) on a detected direction-change, KEEP the current direction but
+  //       drop V_limit to SEEBECK_LOWV_FLOOR_MV and I_limit to
+  //       SEEBECK_LOWV_I_MA (OE on) -> SB_LOWV_SETTLE. The rail falls to
+  //       the I-limited floor; the converter never de-energises.
+  //   (2) SB_LOWV_SETTLE: re-assert the floor each tick; after
+  //       SEEBECK_LOWV_SETTLE_MS, flip the bridge LIVE (hb_setDirection,
+  //       OE stays on) -> SB_LOWV_DWELL. At the low I-limited rail the
+  //       reversal transient is bounded and there is no OE off->on
+  //       converter-restart inrush (the per-flip SCP source).
+  //   (3) SB_LOWV_DWELL: re-assert the floor for SEEBECK_LOWV_DWELL_MS so
+  //       the reversal settles, then return to SB_IDLE and arm the
+  //       soft-start, which ramps the current to full in the new
+  //       direction. The converter is never de-energised, so the
+  //       reversed Seebeck EMF cannot drag the rail below ground — that
+  //       below-ground dead-rail excursion is the Rev B kill (bench:
+  //       OE-off dwell 54/54 killed; LOW-V powered flip 3/3 survived,
+  //       5.99 A back, no SCP). "Do not drive the TEC hard against its
+  //       Seebeck EMF."
+  //
+  // SEEBECK_POWERED_FLIP=0 (Rev A / EVM, legacy): drops OE and waits a
+  // measured-EMF-scaled period on the dead rail before flipping
+  // (validated on the Rev A rig, whose cap/bridge topology tolerated the
+  // dwell). The three OE-off steps:
   //   (1) on detected direction-change, tps_setOutput(false), enter SETTLE
   //   (2) SETTLE_MS later: read INA bus voltage. The DRV8701E
   //       H-bridge has EN tied high (always enabled), so the commanded
@@ -1418,10 +1467,96 @@ static void task_100ms() {
   // FAULT_GRACE_MS, blocked operator-emergency-off for up to 3 s,
   // and starved task_slow). Gated outside FAULT_GRACE_MS so a first-
   // tick flip cannot consume the grace window inside the wait.
-#if SEEBECK_HB_OFF_MAX_MS > 0
+#if SEEBECK_SM_ACTIVE
   {
     unsigned long now_ms = millis();
     switch (_seebeck_state) {
+#if SEEBECK_POWERED_FLIP
+      case SB_LOWV_SETTLE:
+        // Floored hold in the OLD direction, BEFORE the flip. Re-assert
+        // the V/I floor + OE every tick: actuate is gated off in this
+        // state, and a chip register reset (the Rev B CDC->E0 event)
+        // would otherwise un-floor the rail and drive the old direction
+        // hard — re-flooring defends that. Once the rail has settled
+        // (SEEBECK_LOWV_SETTLE_MS), flip LIVE at the low rail.
+        tps_setVoltageLimit(SEEBECK_LOWV_FLOOR_MV);
+        tps_setCurrentLimit(SEEBECK_LOWV_I_MA);
+        tps_setOutput(true);
+        if ((long)(now_ms - _seebeck_deadline) < 0) break;   // still settling
+        // Settle done. Flip only if the controller still wants to drive:
+        // a deadband tick carries the default drive_dir and would flip
+        // the bridge the wrong way; in that case abort to SB_IDLE and let
+        // actuate drop OE in the OLD direction (a positive back-EMF
+        // float, not the below-ground kill — no reversal happened).
+        if (tec_on) {
+          // LIVE direction flip: toggle the H-bridge pin with OE STILL
+          // ON (no tps_setOutput off/on blink). At the I-limited low rail
+          // there is no current to commutate hard (the DRV8701E internal
+          // dead-time covers the pin toggle), so no shoot-through;
+          // skipping the OE restart also removes the converter-restart
+          // inrush that trips SCP. The floor keeps the rail low through
+          // the dwell that follows.
+          hb_setDirection(drive_dir);
+          _last_drive_dir_exp = drive_dir;
+          _have_last_dir      = true;
+          _seebeck_deadline   = now_ms + SEEBECK_LOWV_DWELL_MS;
+          _seebeck_state      = SB_LOWV_DWELL;
+        } else {
+          _seebeck_state = SB_IDLE;            // actuate drops OE (old dir) this tick
+#if SEEBECK_MIN_SAME_DIR_MS > 0
+          _seebeck_last_done_ms = now_ms;      // start hysteresis floor
+#endif
+        }
+        break;
+      case SB_LOWV_DWELL:
+        // Flipped; now in the NEW direction at the I-limited floor. Hold
+        // here for SEEBECK_LOWV_DWELL_MS so the reversal settles before
+        // ramping to full (the validated "wait n-sec"). Re-assert the
+        // floor each tick (defends a CDC reset); the I_limit floor bounds
+        // the reversed-EMF-aided current during the dwell.
+        tps_setVoltageLimit(SEEBECK_LOWV_FLOOR_MV);
+        tps_setCurrentLimit(SEEBECK_LOWV_I_MA);
+        tps_setOutput(true);
+        if ((long)(now_ms - _seebeck_deadline) < 0) break;   // still dwelling
+        // Dwell done. Hand back to actuate.
+        _seebeck_state = SB_IDLE;
+#if SEEBECK_MIN_SAME_DIR_MS > 0
+        _seebeck_last_done_ms = now_ms;        // start hysteresis floor
+#endif
+        _pid_last_ms = 0;                       // BUG-008 dt sentinel
+        if (tec_on) {
+          // Controller still wants to drive: actuate restores Vmax and
+          // soft-starts the current to full in the commanded direction
+          // (the ramp-up). If the intent reversed during the dwell,
+          // drive_dir now differs from the flipped bridge — keep history
+          // in sync with what actuate will drive so the next IDLE tick
+          // does not spuriously re-trigger, and actuate's LIVE
+          // hb_setDirection re-aligns the bridge benignly (the re-flip is
+          // back toward the gradient, not against it).
+          _last_drive_dir_exp = drive_dir;
+#if ENABLE_SOFT_START
+          _ramp_armed = true;                  // soft-start I to full (the ramp-up)
+#endif
+        } else {
+          // Controller reached the deadband during the dwell (the PID
+          // output can fall below the drive threshold right after the
+          // flip, since the flip itself was triggered by crossing
+          // setpoint). The actuate else-branch will drop OE this tick,
+          // but the bridge is still flipped to the NEW direction —
+          // reversed vs the not-yet-caught-up gradient — so an OE-off now
+          // is the dead-rail kill. Re-align the bridge to the pre-flip
+          // (gradient) direction FIRST (live, OE still on) so the OE-off
+          // floats the rail to +Vs. Same defence as the mid-dwell
+          // disable path below; with two directions the pre-flip
+          // direction is the opposite of the current bridge direction.
+          uint8_t aligned = (hb_getDirection() == HB_COOL) ? HB_HEAT : HB_COOL;
+          hb_setDirection(aligned);
+          // History tracks the (re-aligned) bridge so a later resume in
+          // this same direction does not spuriously trigger a no-op flip.
+          _last_drive_dir_exp = aligned;
+        }
+        break;
+#else
       case SB_OE_OFF_SETTLE:
         if ((long)(now_ms - _seebeck_deadline) >= 0) {
           // ina_readVoltageV scales an unsigned LSB — always >= 0,
@@ -1477,9 +1612,11 @@ static void task_100ms() {
           }
         }
         break;
+#endif  // SEEBECK_POWERED_FLIP (else = OE-off SETTLE/WAIT cases)
       case SB_IDLE:
       default:
-        // Detect direction-change → enter SETTLE. Triggers only when:
+        // Detect direction-change → start the flip sequence. Triggers
+        // only when:
         //   - controller actually wants to drive this tick (tec_on),
         //   - we have a recorded prior driving direction,
         //   - new direction differs from the recorded one,
@@ -1487,12 +1624,11 @@ static void task_100ms() {
         //     flip burns the grace window inside the wait and a
         //     spurious FAULT[FAN] / FAULT[NOPSU] latches next tick,
         //   - we are past the SEEBECK_MIN_SAME_DIR_MS hysteresis
-        //     floor since the last wait completed — suppresses
+        //     floor since the last flip completed — suppresses
         //     limit-cycle flip noise (a controller oscillating around
-        //     setpoint after the previous wait has already protected
+        //     setpoint after the previous flip has already protected
         //     against the polarity-flip transient; firing again
-        //     within ~1 s adds OE-off duty cycle without safety
-        //     benefit).
+        //     within ~1 s adds duty cycle without safety benefit).
         if (tec_on
             && _have_last_dir
             && drive_dir != _last_drive_dir_exp
@@ -1501,6 +1637,30 @@ static void task_100ms() {
             && (now_ms - _seebeck_last_done_ms) > SEEBECK_MIN_SAME_DIR_MS
 #endif
             ) {
+#if SEEBECK_POWERED_FLIP
+          // LOW-V powered flip: keep OE on, keep the CURRENT (old)
+          // direction, drop V/I to the floor so the rail falls without
+          // de-energising the converter, and enter SB_LOWV_SETTLE; the
+          // live flip happens there once the rail has settled. OE never
+          // drops to a dead rail (the Rev B kill). Skipped under a PD
+          // clamp (M2): a flip there falls through to the bare actuate
+          // hb_safeDirectionChange so the clamp's reduced V/I limits are
+          // not stranded by the floor writes. All three writes must
+          // land; on NACK skip the SM and let actuate retry (its NACKs
+          // accumulate toward FAULT[NOPSU]).
+          if (!g_pd_clamped
+              && tps_setVoltageLimit(SEEBECK_LOWV_FLOOR_MV)
+              && tps_setCurrentLimit(SEEBECK_LOWV_I_MA)
+              && tps_setOutput(true)) {
+            _seebeck_deadline      = now_ms + SEEBECK_LOWV_SETTLE_MS;
+            _seebeck_state         = SB_LOWV_SETTLE;
+            // floored rail < SUPPLY_VLIM_FLOOR: clear the supply-check
+            // arm so the NOPSU check skips the deliberate low rail.
+            // Re-armed by the first post-dwell actuate tick once full
+            // Vmax is restored.
+            _tried_drive_last_tick = false;
+          }
+#else
           // OE-off NACK: chip is still driving in the OLD direction.
           // Sampling INA at +20 ms would give the regulated output
           // (5-15 V), not Seebeck — wait_ms would saturate to MAX
@@ -1512,6 +1672,7 @@ static void task_100ms() {
             _seebeck_state         = SB_OE_OFF_SETTLE;
             _tried_drive_last_tick = false;  // chip is OE-off during wait
           }
+#endif
         }
         // Record current direction only on active-drive ticks.
         // A deadband tick leaves drive_dir at its default (HB_COOL),
@@ -1525,10 +1686,26 @@ static void task_100ms() {
         break;
     }
     // Safety: if g_enabled went false (operator off or fault latch)
-    // while we were waiting, drop the state so the else-branch below
-    // can run normal disable cleanup. The chip is already OE-off from
-    // the SETTLE entry, so no additional write is needed here.
-    if (!g_enabled) _seebeck_state = SB_IDLE;
+    // while the flip was mid-sequence, drop the state so the actuate
+    // else-branch below runs normal disable cleanup this same tick.
+    if (!g_enabled) {
+#if SEEBECK_POWERED_FLIP
+      // Mid-flip disable on Rev B: during SB_LOWV_DWELL the bridge has
+      // been flipped but the Seebeck gradient has not yet caught up, so
+      // the bridge is reversed relative to it. The actuate else-branch's
+      // OE-off (this same tick) would then drag the rail below ground —
+      // the dead-rail kill. Re-align the bridge to the PRE-FLIP
+      // direction (live, OE still on at the floor) FIRST, so the OE-off
+      // floats the rail to +Vs (positive back-EMF) instead. With only
+      // two directions, the pre-flip direction is simply the opposite of
+      // the current bridge direction. SB_LOWV_SETTLE needs no fix-up:
+      // the bridge is still in the old (gradient-aligned) direction
+      // there, so its OE-off is already safe.
+      if (_seebeck_state == SB_LOWV_DWELL)
+        hb_setDirection(hb_getDirection() == HB_COOL ? HB_HEAT : HB_COOL);
+#endif
+      _seebeck_state = SB_IDLE;
+    }
   }
   if (_seebeck_state == SB_IDLE)
 #endif
@@ -1604,7 +1781,19 @@ static void task_100ms() {
       writes_ok &= tps_setVoltageLimit(g_vmax_mV);
 #endif
     }
+#if SEEBECK_POWERED_FLIP
+    // Rev B: a direction change reaching actuate means the LOW-V flip SM
+    // did NOT handle it (a flip wanted under a PD clamp, or any path that
+    // bypassed the SM). Flip LIVE (hb_setDirection, OE stays on) — never
+    // the OE-off hb_safeDirectionChange, which with a Seebeck gradient
+    // present is the Rev B dead-rail kill. A bare live flip at drive
+    // level may trip SCP (recoverable) but never wedges the chip; the
+    // clean, SCP-free flip is the SM's job (floor + dwell + live). When
+    // no flip is needed this is a no-op (drive_dir == current bridge).
+    hb_setDirection(drive_dir);
+#else
     hb_safeDirectionChange(drive_dir);
+#endif
     writes_ok &= tps_setOutput(true);
     _tried_drive_last_tick = writes_ok;   // arm the supply-Vlim check for next tick
     // Persistent-NACK tracking (BUG-003 addendum follow-up): if
@@ -1620,7 +1809,17 @@ static void task_100ms() {
     }
   } else {
     tps_setOutput(false);
-    hb_setDirection(HB_COOL);        // safe default when off
+#if !SEEBECK_POWERED_FLIP
+    hb_setDirection(HB_COOL);        // Rev A: safe default when off
+#endif
+    // Rev B: do NOT force the bridge to HB_COOL here. With OE off the
+    // dir pin carries no current, but toggling it could leave the bridge
+    // reversed relative to a still-present Seebeck gradient — and the
+    // always-enabled DRV8701E MOSFETs then present that reversed EMF to
+    // the de-energised rail (the dead-rail kill). Leaving the bridge in
+    // its last (gradient-aligned) direction keeps the OE-off a safe
+    // positive back-EMF float. The mid-flip disable path above already
+    // re-aligns the bridge before this OE-off when a flip was in flight.
     _tried_drive_last_tick = false;  // chip's Vlim reading is meaningless when not driving
     // NOTE: _tps_write_nack_count is NOT cleared here. Earlier
     // revisions did, on the theory "no drive intent → no NACK
@@ -1635,8 +1834,9 @@ static void task_100ms() {
     // success paths (a writes_ok=true actuate tick, or a
     // _tps_only_recover success leg) drop it back to zero.
   }
-  }  // _seebeck_state == SB_IDLE — when non-IDLE, the chip is OE-off
-     // and actuate writes are suppressed until the wait deadline elapses.
+  }  // _seebeck_state == SB_IDLE — when non-IDLE a flip is mid-sequence
+     // (LOW-V floor with OE on, or the legacy OE-off wait) and actuate
+     // writes are suppressed until the flip completes.
 
   // Fan runs at the configured speed when enabled. When disabled, it
   // still spins at FAN_DISABLED_SPEED for passive cooling — this

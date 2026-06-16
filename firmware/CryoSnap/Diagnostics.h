@@ -86,9 +86,28 @@ inline void task_diag() {
   if (tps_resp) {
     uint8_t cdc = tps_getCDC();
     if (tps_lastReadOk() && cdc != TPS_CDC_OPMODE) {
-      // Silent recover — drift is invisible to the operator but
-      // brief; trips surface via NACK counter if recovery fails.
-      _tps_only_recover();
+      // OE-SAFE CDC re-assert. The CDC register silently reverted to
+      // its power-on default (0xE0) after a Vin transient. Re-write
+      // ONLY that register back to the operating mode (0xA0). Do NOT
+      // call _tps_only_recover()/tps_init() here: that resets the
+      // chip's V/I limits AND drops OE, which is fatal during the
+      // Rev B LOW-V powered flip — OE-off with a reversed Seebeck EMF
+      // on the load is exactly the dead-rail condition that wedges the
+      // chip off the I2C bus. The actuate stage re-writes V/I every
+      // 100 ms tick (and the flip SM re-asserts its floor each tick),
+      // so CDC is the only register a silent reset leaves stale — a
+      // targeted CDC write is both sufficient and the safest action.
+      // Drift is invisible to the operator but brief; a genuine chip
+      // loss still surfaces via the task_100ms TPS-presence path.
+      // NOTE: this is an intentional change for BOTH targets (not just
+      // Rev B). On v0.7.11 a CDC drift ran a full _tps_only_recover()
+      // (tps_init + clear of supply/NACK counters + g_pd_clamped release
+      // + soft-start re-arm + Seebeck SM reset). The targeted write does
+      // none of those side effects — which is also more correct: a 1 Hz
+      // CDC drift no longer silently disarms a deliberately-latched PD
+      // clamp. A real chip loss still gets the full recovery via the
+      // task_100ms TPS-presence path.
+      _tps_write(TPS_REG_CDC, TPS_CDC_OPMODE);
     }
   }
 

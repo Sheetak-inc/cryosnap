@@ -199,6 +199,7 @@
   // mitigation; both Phase-5-class chip-wedge avoidance and inrush
   // protection are sacrificed for footprint.
   #define SEEBECK_HB_OFF_MAX_MS     0
+  #define SEEBECK_POWERED_FLIP      0
   #define ENABLE_SEEBECK_TRACE      0
 #endif
 
@@ -326,6 +327,63 @@
 #ifndef SEEBECK_MIN_SAME_DIR_MS
 #define SEEBECK_MIN_SAME_DIR_MS   1000
 #endif
+
+// ---------------------------------------------------------------------
+// LOW-V powered flip (Rev B; selected by SEEBECK_POWERED_FLIP=1)
+// ---------------------------------------------------------------------
+// The Rev B alternative to the OE-off measured-wait above. On Rev B,
+// dropping OE to reverse lets the cap decay into the Seebeck band and
+// then puts the REVERSED EMF across a de-energised rail -> below-ground
+// excursion -> the TPS wedges off the I2C bus (bench: 54/54 kills). So
+// the converter stays POWERED through the whole reversal:
+//   (1) on a detected direction-change, KEEP the old direction but drop
+//       V_limit to SEEBECK_LOWV_FLOOR_MV and I_limit to SEEBECK_LOWV_I_MA
+//       (OE stays on). The rail falls to the I-limited floor over
+//       SEEBECK_LOWV_SETTLE_MS.
+//   (2) flip the H-bridge LIVE (hb_setDirection — OE never drops, no
+//       off/on blink). At the low I-limited rail the reversal transient
+//       is bounded, and skipping the OE restart avoids the converter-
+//       restart inrush that trips SCP.
+//   (3) hold at the floor for SEEBECK_LOWV_DWELL_MS so the reversal
+//       settles, then hand back to actuate, which restores Vmax and
+//       soft-starts the current to full in the new direction (the
+//       ramp-up). "Do not drive the TEC hard against its Seebeck EMF."
+// Bench-validated on the Rev B board (2026-06-15 two-flow comparison:
+// LOW-V reverse 3/3 survived, 5.99 A back, no SCP, chip on-bus the whole
+// time; the OE-off reverse killed the chip 2/2 on the same rig).
+//
+// SEEBECK_LOWV_FLOOR_MV  — V_limit during the flip. The TPS regulates
+//   no lower than ~800 mV (0 V is unreachable); the converter cannot
+//   source above this, so the rail sits low through the toggle.
+// SEEBECK_LOWV_I_MA      — I_limit during the flip; bounds the reversal
+//   transient and the dwell current.
+// SEEBECK_LOWV_SETTLE_MS — pre-flip settle: lets the rail/current fall
+//   to the floor before the live toggle (>= one 100 ms tick).
+// SEEBECK_LOWV_DWELL_MS  — post-flip dwell at the floor before ramp-up
+//   (the validated "wait n-sec"; 2000 ms = the bench value).
+#ifndef SEEBECK_LOWV_FLOOR_MV
+#define SEEBECK_LOWV_FLOOR_MV     800
+#endif
+#ifndef SEEBECK_LOWV_I_MA
+#define SEEBECK_LOWV_I_MA         1500
+#endif
+#ifndef SEEBECK_LOWV_SETTLE_MS
+#define SEEBECK_LOWV_SETTLE_MS    400
+#endif
+#ifndef SEEBECK_LOWV_DWELL_MS
+#define SEEBECK_LOWV_DWELL_MS     2000
+#endif
+
+// Unified "Seebeck state machine compiled in" predicate: true for
+// either the Rev B LOW-V powered flip (SEEBECK_POWERED_FLIP) or the
+// Rev A OE-off measured-wait (SEEBECK_HB_OFF_MAX_MS > 0). Gates the SM
+// state declarations, the SM block inside actuate, and the direction-
+// history resets. NOTE: SEEBECK_POWERED_FLIP resolves per-target in
+// Pins.h (1 on Rev B, 0 on Rev A) and is UNDEFINED when this header is
+// first processed, so this must stay a deferred macro — expanded at
+// each `#if SEEBECK_SM_ACTIVE` site after Pins.h has run — never an
+// `#if` evaluated here.
+#define SEEBECK_SM_ACTIVE (SEEBECK_POWERED_FLIP || SEEBECK_HB_OFF_MAX_MS > 0)
 
 #ifndef ENABLE_VERBOSE_BOOT
 // Default OFF. EEPROM blank/loaded status, PD-reinit chatter, and

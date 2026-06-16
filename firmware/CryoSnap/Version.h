@@ -4,11 +4,89 @@
 // Firmware version — update on each meaningful change.
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  11
-#define FW_VERSION_STR    "0.7.11"
+#define FW_VERSION_PATCH  12
+#define FW_VERSION_STR    "0.7.12"
 
 /*
   Changelog (newest first):
+
+  0.7.12  Seebeck LOW-V powered flip (Rev B) — replaces the OE-off wait
+
+    Branched off v0.7.11. On the Rev B board the v0.7.11 OE-off
+    measured-wait recipe is fatal: dropping OE to reverse lets the TPS
+    output cap decay into the Seebeck band and then puts the REVERSED
+    EMF across a de-energised rail, dragging it below ground until the
+    TPS wedges off the I2C bus (bench: 54/54 kills, recovery only via a
+    full chip re-init). The cap/bridge topology that tolerated the
+    dwell on the Rev A rig does not on Rev B.
+
+    Fix: keep the converter POWERED through the entire reversal. New
+    compile-time recipe SEEBECK_POWERED_FLIP (Pins.h: default 1 on
+    Rev B, 0 on Rev A = the legacy OE-off path, untouched). The Rev B
+    LOW-V flip sequence (SB_LOWV_SETTLE -> SB_LOWV_DWELL):
+      (1) on a polarity change, KEEP the old direction but drop V_limit
+          to SEEBECK_LOWV_FLOOR_MV (800 mV) and I_limit to
+          SEEBECK_LOWV_I_MA (1500 mA), OE on. The rail falls to the
+          I-limited floor; the converter never de-energises.
+      (2) after SEEBECK_LOWV_SETTLE_MS (400 ms), flip the H-bridge LIVE
+          (hb_setDirection — OE stays on, no off/on blink). At the low
+          I-limited rail the reversal transient is bounded and there is
+          no converter-restart inrush (the per-flip SCP source).
+      (3) hold at the floor for SEEBECK_LOWV_DWELL_MS (2000 ms) so the
+          reversal settles, then return to SB_IDLE; actuate restores
+          Vmax and soft-starts the current to full in the new direction.
+
+    Bench validation (Rev B, 2026-06-15 two-flow comparison, ~70 W
+    gradient): LOW-V reverse 3/3 survived, 5.99 A back, no SCP, chip
+    on-bus (CDC A0) the whole time; the OE-off reverse killed the chip
+    2/2 on the same rig (STATUS+CDC NACK, recovery via Enable:0 + chip
+    reconfigure). Max-power end-to-end (powered flip, both directions)
+    was 4/4 survived, 0 kills, 0 SCP, CDC A0 every poll.
+
+    Two pre-ship fixes carried for the powered-flip path:
+      M1  CDC-drift recovery in Diagnostics.h (task_diag, 1 Hz) is now
+          an OE-SAFE targeted CDC register write, not _tps_only_recover/
+          tps_init — the old path dropped OE, which during the dwell
+          (reversed EMF on the load) would itself cause the dead-rail
+          kill. Actuate re-writes V/I every tick, so CDC is the only
+          register a silent reset leaves stale. This is intentional for
+          BOTH targets (a 1 Hz CDC drift no longer silently disarms a
+          latched PD clamp); a real chip loss still gets the full
+          recovery via the task_100ms TPS-presence path. _tps_only_recover
+          now also resets _seebeck_state to SB_IDLE so a chip-loss
+          recovery mid-flip restarts cleanly.
+      M2  the powered-flip SM is skipped under a PD-budget clamp so the
+          clamp's reduced V/I limits are not stranded by the floor
+          writes; the flip then falls through to actuate, which on Rev B
+          does a LIVE hb_setDirection (see "Post-flip dwell hardening").
+
+    Post-flip dwell hardening (from a multi-agent adversarial review;
+    these guard concurrent events the 3/3 bench run did not exercise):
+      - On Rev B, actuate NEVER uses the OE-off hb_safeDirectionChange:
+        any direction change that bypasses the LOW-V SM (PD clamp, or a
+        mid-dwell intent reversal that lands at dwell-exit) does a LIVE
+        hb_setDirection instead. A bare live flip survives (may trip a
+        recoverable SCP) where the OE-off path would wedge the chip.
+      - A fault/disable latching DURING the dwell (OVERTEMP being the
+        likely one, since the fan is on VOUT and dips during the hold)
+        used to drop OE while the bridge was reversed vs the gradient =
+        the kill. Now the disable path re-aligns the bridge to the
+        pre-flip direction (live, OE still on) BEFORE OE drops, so the
+        OE-off floats the rail to +Vs. Relatedly, on Rev B the disable
+        else-branch no longer forces the bridge to HB_COOL after OE-off
+        (which could reverse it vs the gradient).
+
+    Knobs (Config.h): SEEBECK_LOWV_FLOOR_MV / _I_MA / _SETTLE_MS /
+    _DWELL_MS. Cost: a ~2.4 s low-power window per large-ΔT reversal
+    (settle + dwell; fixed, deterministic). Fan is on VOUT so airflow
+    dips during the hold (OVERTEMP backstops; Rev C: fan on input rail).
+
+    Still open before a FIELD default: Rev A vs Rev B topology contrast;
+    fresh-board confirmation (all data is the one Rev B unit); scope of
+    the below-ground excursion; the SAFETY_FAULTS=1 fault-latch chain
+    not yet cleanly bench-tested on Rev B (D5 fan-tach false-fault until
+    a tach pull-up is added); a slow deadband-crossing reversal vs the
+    large setpoint swings tested.
 
   0.7.11  Seebeck-measure-and-adjust, non-blocking state machine
 
