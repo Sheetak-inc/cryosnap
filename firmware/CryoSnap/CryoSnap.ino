@@ -172,6 +172,14 @@ static bool _husb_was_attached = false;
 // reset everything on every enable rising edge.
 #define SUPPLY_VLIM_FLOOR    5500  // mV — V_limit at or below this after a drive attempt = chip auto-reset
 #define SUPPLY_FAULT_DEBOUNCE   2  // bad reads anywhere in the drive session before latching
+// INA bus voltage below this = a genuinely collapsed rail (real short).
+// The TPS asserts its SCP status bit whenever the output sits at/below
+// its ~0.8 V short threshold WHILE regulating — which for a TEC also
+// happens at legitimate low-voltage operating points (notably the
+// powered-flip floor: bench log 27.txt SCP'd at a healthy 0.845 V /
+// 0.945 A). The fast SCP poll corroborates the status bit against this
+// threshold so only a real short (rail dragged to ~0 V) latches a fault.
+#define SCP_REAL_SHORT_V      0.5f  // V (INA bus reading)
 static uint8_t  _supply_fault_count       = 0;
 static bool     _tried_drive_last_tick    = false;
 // Captured for the FAULT[NOPSU] trip print so the operator can see
@@ -1264,7 +1272,25 @@ static void task_100ms() {
   {
     static bool _scp_last = false;
     uint8_t status = _tps_read(TPS_REG_STATUS);
-    bool scp = (status & 0x80) != 0;       // bit 7 = SCP
+    bool scp_bit = (status & 0x80) != 0;   // bit 7 = SCP status
+    // Corroborate the status bit against the INA before treating it as a
+    // fault. The TPS asserts SCP whenever the rail sits at/below its
+    // ~0.8 V short threshold while regulating — which for a TEC also
+    // occurs at legitimate low-voltage operating points (the powered-flip
+    // floor, low-current drive), not just real shorts. A genuine short
+    // drags the rail to ~0 V; a healthy low rail stays well above. Only
+    // latch when the rail has actually collapsed. (Same spirit as the
+    // OCP mask: current-limit / low-rail is normal for this load.) The
+    // INA is read only when the bit is set, so the common path is free.
+#if SEEBECK_POWERED_FLIP
+    // Rev B: the LOW-V powered flip regulates the rail near the chip's
+    // SCP threshold, so the status bit fires on healthy low-rail points.
+    // Corroborate before latching (Rev A keeps the naive latch — it does
+    // not use the flip floor, and is flash-locked).
+    bool scp = scp_bit && (ina_readVoltageV() < SCP_REAL_SHORT_V);
+#else
+    bool scp = scp_bit;
+#endif
     if (scp && !_scp_last && g_fault == FAULT_NONE) {
       g_enabled = false;
       g_fault   = FAULT_TPS_PG;

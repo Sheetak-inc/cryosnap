@@ -352,17 +352,27 @@
 // LOW-V reverse 3/3 survived, 5.99 A back, no SCP, chip on-bus the whole
 // time; the OE-off reverse killed the chip 2/2 on the same rig).
 //
-// SEEBECK_LOWV_FLOOR_MV  — V_limit during the flip. The TPS regulates
-//   no lower than ~800 mV (0 V is unreachable); the converter cannot
-//   source above this, so the rail sits low through the toggle.
+// SEEBECK_LOWV_FLOOR_MV  — V_limit during the flip. Must stay clear of
+//   the TPS55288's ~0.8 V short-circuit (SCP) threshold: regulating the
+//   rail right at 0.8 V (the chip's minimum V_limit) makes the chip
+//   assert SCP on a perfectly healthy low-rail operating point, which
+//   the firmware would otherwise latch as a fault and abort the flip
+//   (bench log 27.txt: SCP at V=0.845 V / I=0.945 A, Vlim=0.80 V — not
+//   a short). 1500 mV keeps the rail (current-limited to SEEBECK_LOWV_I_MA
+//   at ~1.3 V on this TEC) comfortably above the SCP regime while the
+//   flip stays gentle — the current limit, not this floor, is what
+//   bounds the reversal. The SCP latch is also INA-corroborated now
+//   (see the FAST TPS STATUS POLL in CryoSnap.ino), so a benign low rail
+//   no longer faults regardless of this value.
 // SEEBECK_LOWV_I_MA      — I_limit during the flip; bounds the reversal
-//   transient and the dwell current.
+//   transient and the dwell current, and sets the floor operating point
+//   (V_out ~= I_limit x R_tec, kept above the SCP threshold).
 // SEEBECK_LOWV_SETTLE_MS — pre-flip settle: lets the rail/current fall
 //   to the floor before the live toggle (>= one 100 ms tick).
 // SEEBECK_LOWV_DWELL_MS  — post-flip dwell at the floor before ramp-up
 //   (the validated "wait n-sec"; 2000 ms = the bench value).
 #ifndef SEEBECK_LOWV_FLOOR_MV
-#define SEEBECK_LOWV_FLOOR_MV     800
+#define SEEBECK_LOWV_FLOOR_MV     1500
 #endif
 #ifndef SEEBECK_LOWV_I_MA
 #define SEEBECK_LOWV_I_MA         1500

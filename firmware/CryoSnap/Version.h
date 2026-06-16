@@ -4,11 +4,43 @@
 // Firmware version — update on each meaningful change.
 #define FW_VERSION_MAJOR  0
 #define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  12
-#define FW_VERSION_STR    "0.7.12"
+#define FW_VERSION_PATCH  13
+#define FW_VERSION_STR    "0.7.13"
 
 /*
   Changelog (newest first):
+
+  0.7.13  Fix false FAULT[SCP] from the LOW-V flip floor
+
+    Symptom: in normal Auto-mode PID operation the production build
+    latched FAULT[SCP] and disabled (bench log 27.txt). The dump showed
+    a HEALTHY operating point at the trip — INA V=0.845 V, I=0.945 A,
+    with Vlim=0.80 V / Ilim=1.50 A (the LOW-V flip floor) — i.e. NOT a
+    short. (Auto + Kp=5000 near setpoint dithers direction, so the SM
+    ran flips constantly, exposing it.)
+
+    Root cause: SEEBECK_LOWV_FLOOR_MV was 800 mV, exactly the TPS55288's
+    ~0.8 V short-circuit threshold. Regulating the rail at that floor
+    makes the chip assert its SCP status bit on a perfectly healthy
+    low-rail point; the production SCP latch (task_100ms) then faulted
+    and aborted the flip. It was hidden in bench validation because the
+    bench build surfaces SCP as a NON-latching BSCP marker (the flip
+    completed anyway) and the standalone harness under-counted those
+    markers — so the run read a false "0 SCP". Production latches, so it
+    surfaced on the first real closed-loop run.
+
+    Two-part fix:
+      1. Raise SEEBECK_LOWV_FLOOR_MV to 1500 mV — clear of the SCP
+         regime. The current limit (SEEBECK_LOWV_I_MA) still bounds the
+         reversal, so the flip stays gentle; the rail now regulates
+         ~1.3 V (current-limited on this TEC), well above ~0.8 V.
+      2. Corroborate the SCP status bit against the INA in the fast
+         poll: only latch FAULT[SCP] when the rail has genuinely
+         collapsed (< SCP_REAL_SHORT_MV = 500 mV). A real short still
+         drags the rail to ~0 V and latches; a healthy low-rail point no
+         longer false-faults. Same spirit as the existing OCP mask
+         (current-limit / low-rail is normal for a TEC). The INA is read
+         only when the status bit is set, so the common path is unchanged.
 
   0.7.12  Seebeck LOW-V powered flip (Rev B) — replaces the OE-off wait
 
