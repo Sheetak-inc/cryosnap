@@ -16,6 +16,14 @@
         there but the converter is off. Usually the bench rocker
         switch or a USB-C cable issue.
     (c) TPS responding, but INA doesn't ACK — current sensing died.
+    (d) TPS responding, but CDC register reverted to power-on
+        default (0xE0 instead of TPS_CDC_OPMODE=0xA0). The chip
+        silently reset its registers — usually a Vin brownout
+        during high-current drive that didn't go far enough to
+        drop the I2C interface. Firmware-side state is now stale.
+        Recover via _tps_only_recover() which re-runs tps_init()
+        and clears the supply-fault counters. BUG-003 addendum
+        Fix 2.
     (e) TPS OE on, but INA reads ~0 A for several ticks — probably
         a disconnected or open TEC.
 
@@ -66,6 +74,41 @@ inline void task_diag() {
   // (c) TPS ok but INA missing.
   if (tps_resp && !ina_resp && (!_tps_resp_last || _ina_resp_last)) {
     Serial.println(F("DIAG: Current sensing INA226 offline"));
+  }
+
+  // (d) TPS ok but CDC reverted to power-on default — the chip
+  // silently reset during a Vin transient and tps_init's CDC write
+  // never re-landed. Without this check, the firmware would happily
+  // command V/I writes that the chip might also drop, eventually
+  // accumulating supply-fault counter increments and tripping NOPSU
+  // for the wrong reason (BUG-003 addendum 2026-06-05). Cheap: one
+  // I2C byte read at 1 s cadence.
+  if (tps_resp) {
+    uint8_t cdc = tps_getCDC();
+    if (tps_lastReadOk() && cdc != TPS_CDC_OPMODE) {
+      // OE-SAFE CDC re-assert. The CDC register silently reverted to
+      // its power-on default (0xE0) after a Vin transient. Re-write
+      // ONLY that register back to the operating mode (0xA0). Do NOT
+      // call _tps_only_recover()/tps_init() here: that resets the
+      // chip's V/I limits AND drops OE, which is fatal during the
+      // Rev B LOW-V powered flip — OE-off with a reversed Seebeck EMF
+      // on the load is exactly the dead-rail condition that wedges the
+      // chip off the I2C bus. The actuate stage re-writes V/I every
+      // 100 ms tick (and the flip SM re-asserts its floor each tick),
+      // so CDC is the only register a silent reset leaves stale — a
+      // targeted CDC write is both sufficient and the safest action.
+      // Drift is invisible to the operator but brief; a genuine chip
+      // loss still surfaces via the task_100ms TPS-presence path.
+      // NOTE: this is an intentional change for BOTH targets (not just
+      // Rev B). On v0.7.11 a CDC drift ran a full _tps_only_recover()
+      // (tps_init + clear of supply/NACK counters + g_pd_clamped release
+      // + soft-start re-arm + Seebeck SM reset). The targeted write does
+      // none of those side effects — which is also more correct: a 1 Hz
+      // CDC drift no longer silently disarms a deliberately-latched PD
+      // clamp. A real chip loss still gets the full recovery via the
+      // task_100ms TPS-presence path.
+      _tps_write(TPS_REG_CDC, TPS_CDC_OPMODE);
+    }
   }
 
   // (e) TPS driving but no current visible at INA. Debounce for 3

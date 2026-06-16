@@ -26,21 +26,28 @@
     deadband is configured to zero.
 
   Public API:
-    hb_init()                   configure PIN_DIR as output, set LOW
+    hb_init()                   configure PIN_DIR as output, default HB_COOL
     hb_setDirection(dir)        set direction (HEAT / COOL)
     hb_getDirection()           read current direction
     hb_safeDirectionChange(dir) TPS off -> settle -> toggle -> TPS on
 */
 
-// H-bridge direction polarity. On the Rev A PCB, LOW=Cool / HIGH=Heat.
-// On the bench prototype the wiring is inverted — swap here so the
-// control logic doesn't need to know.
-#if BUILD_TARGET == TARGET_PROTO
-  #define HB_COOL  HIGH   // prototype: inverted wiring
+// H-bridge direction polarity. Bench-confirmed identical on both
+// production targets (LOW = drive toward Heat side, HIGH = drive
+// toward Cool):
+//   Rev A   confirmed 2026-06-03 (BUG-000 in the audit log; the
+//           earlier comment claimed the opposite, which was wrong)
+//   Rev B   confirmed 2026-06-10 — 200 mA Cool drive on the first
+//           assembled Rev B board produced a monotonic 1.00 C drop
+//           in Tcold over 47 s
+// If a future board build heats when commanded to cool, swap the
+// HB_COOL/HB_HEAT pair in the offending branch below.
+#if BUILD_TARGET == TARGET_REVB
+  #define HB_COOL  HIGH
   #define HB_HEAT  LOW
-#else
-  #define HB_COOL  LOW    // Rev A PCB: correct wiring
-  #define HB_HEAT  HIGH
+#else  // TARGET_REVA
+  #define HB_COOL  HIGH
+  #define HB_HEAT  LOW
 #endif
 
 // Settle time after disabling TPS before toggling direction.
@@ -50,7 +57,12 @@
 
 static uint8_t _hb_direction = HB_COOL;
 
-// Configure PIN_DIR as output, default to COOL (LOW).
+// Configure PIN_DIR as output and default to HB_COOL. The actual
+// HIGH/LOW level depends on BUILD_TARGET (see the polarity block
+// above) — on TARGET_REVA/TARGET_REVB this is HIGH, on the
+// prototype it is also HIGH. Direction only matters when TPS
+// output is enabled, so this default is just to avoid leaving the
+// pin floating at boot.
 inline void hb_init() {
   pinMode(HW_HB_DIR, OUTPUT);
   digitalWrite(HW_HB_DIR, HB_COOL);

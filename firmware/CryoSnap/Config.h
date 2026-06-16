@@ -4,47 +4,16 @@
 #include <Arduino.h>
 
 // ============================================
-// Pin Definitions (Arduino Nano — bench prototype)
+// Arduino Nano fixed-function pins (informational)
 // ============================================
-
-// UART — hardware defaults
-// RX 0
-// TX 1
-
-// Fan Control
-#define PIN_FAN_TACH 2
-#define PIN_FAN_PWM  3
-
-// WS2812B LED chain
-#define PIN_LED_DAT  7
-
-// H-Bridge direction (DRV8701E PH pin, single GPIO)
-#define PIN_DIR      6
-
-// UI
-#define PIN_BUTTON_ENABLE 8  // needs internal pullup (active low, press = GND)
-
-// SPI — hardware defaults (OLED display, not in firmware scope)
-// MOSI 11
-// MISO 12
-// SCK  13
-
-// Error detection
-#define PIN_nFAULT_TPS55288 A0
-#define PIN_INA_ALERT       10   // INA226 alert output (polled, not ISR)
-
-// NTCs (op-amp conditioned ADC inputs)
-#define NTC_1 A1
-#define NTC_2 A2
-#define NTC_3 A3
-
-// I2C — hardware defaults
-// SDA: A4
-// SCL: A5
-
-// UI
-#define PIN_MODE_SWITCH A6
-#define PIN_POT         A7
+// UART (Serial):    RX = D0, TX = D1
+// SPI:              MOSI = D11, MISO = D12, SCK = D13
+// I2C:              SDA = A4,  SCL = A5
+//
+// All other pin assignments are board-target dependent and live in
+// Pins.h under the canonical HW_* names. The firmware always uses
+// HW_* — never raw pin numbers — so a board re-spin only requires
+// editing Pins.h.
 
 // ============================================
 // System Constants
@@ -63,7 +32,6 @@
 // Driver Hardware Constants
 // ============================================
 #define TPS_RSENSE   0.010f  // TPS55288 sense resistor, Ohms (10 mOhm)
-#define TPS_I2C_ADDR 0x75    // 0x75 on prototype, 0x74 on Rev A
 
 // INA226 shunt resistor.
 // With 10 mOhm: max measurable current = 81.92 mV / 10 mOhm = 8.19 A.
@@ -123,9 +91,37 @@
 //       sees the negotiated USB-PD wattage. Belt-and-braces
 //       protection on top of the TPS hardware current limiter.
 //
-//   ENABLE_VERBOSE_BOOT       ~250 B flash
-//       Boot banner, EEPROM blank/loaded message, PD reinit
-//       chatter, init warnings. Off = silent boot, ready prompt.
+//   ENABLE_SOFT_START         ~150 B flash, 9 B RAM
+//       Linear I_limit ramp on the rising edge of every actuating
+//       window, so neither PID nor bang-bang slams the TEC with full
+//       commanded current the instant OE asserts. Lives above both
+//       controllers — direction is decided by the controller and
+//       applied unchanged. Window stays strictly inside
+//       FAULT_GRACE_MS so the supply-Vlim and fan-tach grace checks
+//       cover the ramp. Ramp re-arms on three triggers: operator
+//       enable, chip recovery via _tps_only_recover, and any actuate
+//       gap longer than SOFT_START_RESET_GAP_MS (deadband stay).
+//       Addresses BUG-003 Phase-5 enable-edge inrush. NOT a fix for
+//       the chip-lockup ceiling — see Version.h v0.7.10 notes.
+//       Tuning: SOFT_START_MS, SOFT_START_I_MA,
+//       SOFT_START_RESET_GAP_MS below. V_limit is NOT ramped (a TEC
+//       is current-limited; V_limit is just a ceiling).
+//
+//   ENABLE_VERBOSE_BOOT       ~380 B flash
+//       EEPROM blank/loaded message, PD reinit chatter, init warnings,
+//       PD-budget echo. Off = silent boot. The version banner ("CryoSnap
+//       vX.Y.Z REVA") is emitted regardless of this flag because
+//       operator and log-parsing tools depend on it.
+//
+//   SEEBECK_HB_OFF_MAX_MS     ~290 B flash, 7 B RAM (when > 0)
+//       Non-blocking Seebeck wait state machine at the actuate layer:
+//       on detected polarity flip, drops OE, reads bus voltage as
+//       Seebeck-EMF proxy, waits proportional to measured EMF, then
+//       performs the H-bridge direction change. Mitigates the
+//       polarity-flip transient that couples Seebeck EMF + H-bridge
+//       inductive kickback into the TPS55288 EN/VCC pin at high ΔT.
+//       Tuning: SEEBECK_HB_OFF_BASE_MS / SETTLE_MS / PER_VOLT_MS /
+//       MAX_MS below. Setting MAX_MS=0 compiles the entire feature out.
 //
 //   ENABLE_SAFETY_FAULTS      ~600 B flash
 //       Master switch for the FOUR fault sources beyond OVERTEMP
@@ -191,11 +187,20 @@
   #define ENABLE_LED_FADE           0
   #define ENABLE_FAULT_LED_FLASH    1
   #define ENABLE_PD_BUDGET_CLAMP    0
+  #define ENABLE_SOFT_START         0
   #define ENABLE_VERBOSE_BOOT       0
   #define ENABLE_SAFETY_FAULTS      0
   #define ENABLE_OLED_DISPLAY       0
   #define ENABLE_DIAGNOSTICS        0
   #define COMPACT_FAULT_MSGS        1
+  // SEEBECK_HB_OFF_MAX_MS=0 compiles the Seebeck wait state machine
+  // out entirely (~290 B flash, 7 B RAM). MINIMAL_BUILD targets ship-
+  // worthy firmware that has neither soft-start nor the polarity-flip
+  // mitigation; both Phase-5-class chip-wedge avoidance and inrush
+  // protection are sacrificed for footprint.
+  #define SEEBECK_HB_OFF_MAX_MS     0
+  #define SEEBECK_POWERED_FLIP      0
+  #define ENABLE_SEEBECK_TRACE      0
 #endif
 
 #ifndef ENABLE_DEBUG_DUMP_REGS
@@ -205,7 +210,12 @@
 #define ENABLE_EEPROM_SETTINGS    1
 #endif
 #ifndef ENABLE_I2C_BOOT_SCAN
-#define ENABLE_I2C_BOOT_SCAN      1
+// Default OFF. Driver-specific WARN messages (WARN TPS, WARN INA,
+// WARN HUSB, WARN OLED) at boot already report missing chips by
+// name. The full bus walk is a bring-up convenience that costs
+// ~300 B flash. Override with -DENABLE_I2C_BOOT_SCAN=1 when an
+// unexpected device may be on the bus.
+#define ENABLE_I2C_BOOT_SCAN      0
 #endif
 #ifndef ENABLE_NTC_CALIBRATION
 #define ENABLE_NTC_CALIBRATION    1
@@ -222,8 +232,177 @@
 #ifndef ENABLE_PD_BUDGET_CLAMP
 #define ENABLE_PD_BUDGET_CLAMP    1
 #endif
+#ifndef ENABLE_SOFT_START
+#define ENABLE_SOFT_START         1
+#endif
+// Soft-start ramp tuning (only used when ENABLE_SOFT_START=1).
+//
+// SOFT_START_MS — ramp duration (linear interpolation from
+//   SOFT_START_I_MA up to g_imax_mA). Must stay strictly below
+//   FAULT_GRACE_MS (3000) so the supply-Vlim and fan-tach grace
+//   windows cover the full ramp. Compile-time guard in
+//   CryoSnap.ino enforces this (placed there because FAULT_GRACE_MS
+//   lives in CryoSnap.ino, included after this header). Default
+//   600 ms: chosen as a "comfortably under the 3 s grace window"
+//   value; not yet derived from a scope measurement of actual
+//   inrush envelope — see Version.h v0.7.10 risk register.
+//
+// SOFT_START_I_MA — starting current at ramp t=0. 200 mA picked to
+//   stay clear of the SUPPLY_VLIM_FLOOR-driven supply check trigger
+//   (which keys on V_limit, not I_limit, but a tiny non-zero current
+//   write makes chip-side telemetry less ambiguous).
+//
+// SOFT_START_RESET_GAP_MS — gap (ms) of "no actuating tick" that
+//   triggers a fresh ramp on the next actuate. Default 500 ms:
+//   comfortably above the 100 ms scheduler period (deadband entry
+//   alone won't re-arm) but well below typical thermostat deadband
+//   stays (so a multi-second deadband followed by a re-drive gets a
+//   fresh ramp). Compile-time constant only; no runtime knob.
+//
+// V_limit is NOT ramped: for a TEC (low-impedance resistive + Seebeck
+// EMF) V_limit is a ceiling that never engages during drive, so
+// ramping it would cost ~50 B flash for no inrush benefit.
+#ifndef SOFT_START_MS
+#define SOFT_START_MS             600
+#endif
+#ifndef SOFT_START_I_MA
+#define SOFT_START_I_MA           200
+#endif
+#ifndef SOFT_START_RESET_GAP_MS
+#define SOFT_START_RESET_GAP_MS   500
+#endif
+
+// Direction-change Seebeck mitigation (non-blocking state machine).
+// When the controller flips drive_dir, the actuate layer drops OE,
+// settles briefly so the TPS output cap equilibrates with the TEC's
+// Seebeck EMF (via the always-enabled DRV8701E H-bridge MOSFETs in
+// linear region — a near-zero-resistance bidirectional path between
+// the INA-side rail and the TEC terminals), READS the residual bus
+// voltage (= |Seebeck EMF| on the de-energised load to within a few
+// mV of MOSFET drop), then waits a measurement-scaled period before
+// re-asserting OE in the new direction. The wait length tracks
+// actual heat-removal conditions: a chilled-water-loop installation
+// keeps ΔT (and therefore Seebeck) small and gets the BASE wait
+// only; a poorly-heatsunk one accumulates large ΔT and gets up to
+// MAX_MS. Does not constrain fast temperature movements when the
+// customer's heat path can keep ΔT low.
+//   wait_ms = BASE_MS + V_seebeck * PER_VOLT_MS  (clamped to MAX_MS)
+//
+// SEEBECK_HB_OFF_BASE_MS — minimum wait per flip, applied even when
+//   measured Seebeck is ~0 V. 100 ms covers the chip's internal
+//   recovery period observed across the Phase-4 toggle sequence.
+//
+// SEEBECK_HB_OFF_SETTLE_MS — quiet period between OE-off and the
+//   INA bus voltage sample, so the TPS output cap equilibrates to
+//   Seebeck EMF via the H-bridge low-Rds path before measurement.
+//
+// SEEBECK_HB_OFF_PER_VOLT_MS — scaling factor from measured Seebeck
+//   voltage to additional wait. 1000 = 1 second of additional wait
+//   per volt of measured Seebeck.
+//
+// SEEBECK_HB_OFF_MAX_MS — clamp ceiling on the computed wait. Also
+//   acts as the feature kill switch: setting MAX_MS=0 compiles the
+//   state machine out entirely (polarity flips proceed without any
+//   mitigation, as in v0.7.10 and earlier).
+#ifndef SEEBECK_HB_OFF_BASE_MS
+#define SEEBECK_HB_OFF_BASE_MS    100
+#endif
+#ifndef SEEBECK_HB_OFF_SETTLE_MS
+#define SEEBECK_HB_OFF_SETTLE_MS   20
+#endif
+#ifndef SEEBECK_HB_OFF_PER_VOLT_MS
+#define SEEBECK_HB_OFF_PER_VOLT_MS 1000
+#endif
+#ifndef SEEBECK_HB_OFF_MAX_MS
+#define SEEBECK_HB_OFF_MAX_MS    3000
+#endif
+
+// Hysteresis floor: after a Seebeck wait completes, suppress new wait
+// triggers for this many ms. Aimed at the limit-cycle case (bang-bang
+// + Mode Auto, EEPROM-stale 0-deadband, etc.) where the controller
+// oscillates around setpoint and the SM would otherwise fire on every
+// crossing. Within the floor, any prior wait has just protected the
+// chip from polarity-flip stress, so a subsequent flip can proceed
+// without a fresh wait. Set to 0 to disable hysteresis.
+#ifndef SEEBECK_MIN_SAME_DIR_MS
+#define SEEBECK_MIN_SAME_DIR_MS   1000
+#endif
+
+// ---------------------------------------------------------------------
+// LOW-V powered flip (Rev B; selected by SEEBECK_POWERED_FLIP=1)
+// ---------------------------------------------------------------------
+// The Rev B alternative to the OE-off measured-wait above. On Rev B,
+// dropping OE to reverse lets the cap decay into the Seebeck band and
+// then puts the REVERSED EMF across a de-energised rail -> below-ground
+// excursion -> the TPS wedges off the I2C bus (bench: 54/54 kills). So
+// the converter stays POWERED through the whole reversal:
+//   (1) on a detected direction-change, KEEP the old direction but drop
+//       V_limit to SEEBECK_LOWV_FLOOR_MV and I_limit to SEEBECK_LOWV_I_MA
+//       (OE stays on). The rail falls to the I-limited floor over
+//       SEEBECK_LOWV_SETTLE_MS.
+//   (2) flip the H-bridge LIVE (hb_setDirection — OE never drops, no
+//       off/on blink). At the low I-limited rail the reversal transient
+//       is bounded, and skipping the OE restart avoids the converter-
+//       restart inrush that trips SCP.
+//   (3) hold at the floor for SEEBECK_LOWV_DWELL_MS so the reversal
+//       settles, then hand back to actuate, which restores Vmax and
+//       soft-starts the current to full in the new direction (the
+//       ramp-up). "Do not drive the TEC hard against its Seebeck EMF."
+// Bench-validated on the Rev B board (2026-06-15 two-flow comparison:
+// LOW-V reverse 3/3 survived, 5.99 A back, no SCP, chip on-bus the whole
+// time; the OE-off reverse killed the chip 2/2 on the same rig).
+//
+// SEEBECK_LOWV_FLOOR_MV  — V_limit during the flip. Must stay clear of
+//   the TPS55288's ~0.8 V short-circuit (SCP) threshold: regulating the
+//   rail right at 0.8 V (the chip's minimum V_limit) makes the chip
+//   assert SCP on a perfectly healthy low-rail operating point, which
+//   the firmware would otherwise latch as a fault and abort the flip
+//   (bench log 27.txt: SCP at V=0.845 V / I=0.945 A, Vlim=0.80 V — not
+//   a short). 1500 mV keeps the rail (current-limited to SEEBECK_LOWV_I_MA
+//   at ~1.3 V on this TEC) comfortably above the SCP regime while the
+//   flip stays gentle — the current limit, not this floor, is what
+//   bounds the reversal. The SCP latch is also INA-corroborated now
+//   (see the FAST TPS STATUS POLL in CryoSnap.ino), so a benign low rail
+//   no longer faults regardless of this value.
+// SEEBECK_LOWV_I_MA      — I_limit during the flip; bounds the reversal
+//   transient and the dwell current, and sets the floor operating point
+//   (V_out ~= I_limit x R_tec, kept above the SCP threshold).
+// SEEBECK_LOWV_SETTLE_MS — pre-flip settle: lets the rail/current fall
+//   to the floor before the live toggle (>= one 100 ms tick).
+// SEEBECK_LOWV_DWELL_MS  — post-flip dwell at the floor before ramp-up
+//   (the validated "wait n-sec"; 2000 ms = the bench value).
+#ifndef SEEBECK_LOWV_FLOOR_MV
+#define SEEBECK_LOWV_FLOOR_MV     1500
+#endif
+#ifndef SEEBECK_LOWV_I_MA
+#define SEEBECK_LOWV_I_MA         1500
+#endif
+#ifndef SEEBECK_LOWV_SETTLE_MS
+#define SEEBECK_LOWV_SETTLE_MS    400
+#endif
+#ifndef SEEBECK_LOWV_DWELL_MS
+#define SEEBECK_LOWV_DWELL_MS     2000
+#endif
+
+// Unified "Seebeck state machine compiled in" predicate: true for
+// either the Rev B LOW-V powered flip (SEEBECK_POWERED_FLIP) or the
+// Rev A OE-off measured-wait (SEEBECK_HB_OFF_MAX_MS > 0). Gates the SM
+// state declarations, the SM block inside actuate, and the direction-
+// history resets. NOTE: SEEBECK_POWERED_FLIP resolves per-target in
+// Pins.h (1 on Rev B, 0 on Rev A) and is UNDEFINED when this header is
+// first processed, so this must stay a deferred macro — expanded at
+// each `#if SEEBECK_SM_ACTIVE` site after Pins.h has run — never an
+// `#if` evaluated here.
+#define SEEBECK_SM_ACTIVE (SEEBECK_POWERED_FLIP || SEEBECK_HB_OFF_MAX_MS > 0)
+
 #ifndef ENABLE_VERBOSE_BOOT
-#define ENABLE_VERBOSE_BOOT       1
+// Default OFF. EEPROM blank/loaded status, PD-reinit chatter, and
+// PD-budget echo are useful during bring-up but not in steady-state
+// operation. The version banner stays emitted regardless (see the
+// banner block in setup()) so operator and log-parsing tools can
+// still identify the running build. Override with
+// -DENABLE_VERBOSE_BOOT=1 on a flash-budget-rich build.
+#define ENABLE_VERBOSE_BOOT       0
 #endif
 #ifndef ENABLE_SAFETY_FAULTS
 #define ENABLE_SAFETY_FAULTS      1
@@ -244,6 +423,15 @@
 #ifndef ENABLE_DIAGNOSTICS
 #define ENABLE_DIAGNOSTICS        1
 #endif
+
+#ifndef ENABLE_SEEBECK_TRACE
+// Default ON when diagnostics are on. Emits a `DIAG: Seebeck V=x.xx
+// wait=NNNNms` line at each polarity-flip wait calculation, then a
+// `DIAG: Seebeck t V=x.xx` line every 100 ms tick during the wait
+// so the EMF decay curve is visible in the serial log. ~150 B flash.
+// Set to 0 in flash-tight builds; auto-zeroed under MINIMAL_BUILD.
+#define ENABLE_SEEBECK_TRACE      ENABLE_DIAGNOSTICS
+#endif
 #ifndef COMPACT_FAULT_MSGS
 #define COMPACT_FAULT_MSGS        0
 #endif
@@ -256,26 +444,47 @@
 // ============================================
 // Default Safety Limits
 // ============================================
+// All DEFAULT_* and tunable macros use the #ifndef pattern so a
+// command-line -D override (e.g. -DDEFAULT_MAX_CURRENT=0.3f for a
+// safety-restricted bring-up flash) actually takes effect. Caught on
+// the 2026-06-10 REVB bring-up: a bare #define silently shadows the
+// -D override and the runtime safety cap stays at the file value.
+#ifndef DEFAULT_MAX_TEMP_HOT
 #define DEFAULT_MAX_TEMP_HOT 60.0f  // Celsius
+#endif
+#ifndef DEFAULT_MAX_CURRENT
 #define DEFAULT_MAX_CURRENT   2.0f  // Amps (TPS55288 I_limit at boot)
+#endif
+#ifndef DEFAULT_MAX_VOLTAGE
 #define DEFAULT_MAX_VOLTAGE  12.0f  // Volts (TPS55288 V_limit at boot)
+#endif
+#ifndef DEFAULT_MAX_POWER
 #define DEFAULT_MAX_POWER    20.0f  // Watts
+#endif
 
 // ============================================
 // Default Control Settings
 // ============================================
+#ifndef DEFAULT_SETPOINT
 #define DEFAULT_SETPOINT     25.0f  // Celsius — target cold-side temp
+#endif
+#ifndef DEFAULT_FAN_SPEED
 #define DEFAULT_FAN_SPEED    180    // 0..255 PWM duty (180 ~ 70%)
-// LED brightness scale, 0..255 (0 = off, 255 = full). 64 (~25%)
-// is comfortable indoors — the full-scale WS2812 chain is bright
-// enough to be uncomfortable on a bench desk. User-adjustable at
+#endif
+// LED brightness scale, 0..255 (0 = off, 255 = full). 15 (~6%)
+// is comfortable for a bench-desk readout; the full-scale WS2812
+// chain is uncomfortably bright at close range. User-adjustable at
 // runtime via the `bright` serial command, persisted to EEPROM
 // via `save`.
 //
 // To change the default: edit the value here; existing EEPROM
 // settings retain their stored value until `defaults` is run.
-#define DEFAULT_LED_BRIGHTNESS  64
+#ifndef DEFAULT_LED_BRIGHTNESS
+#define DEFAULT_LED_BRIGHTNESS  15
+#endif
+#ifndef FAN_DISABLED_SPEED
 #define FAN_DISABLED_SPEED   127    // fan runs at ~50% even when TEC is off (passive cooling)
+#endif
 // Deadband — the window around the setpoint where the TEC is
 // completely off. Prevents the control loop from chattering (rapidly
 // switching on/off) when the measured temperature oscillates within
@@ -291,10 +500,16 @@
 //   - can oscillate the control loop indefinitely
 // Keep this >= 0.1 C. Larger values (0.5-1.0 C) are quieter but give
 // less precise temperature tracking.
+#ifndef DEFAULT_DEADBAND
 #define DEFAULT_DEADBAND     0.2f   // +/- degrees C — TEC off inside band
+#endif
 
+#ifndef DEFAULT_DAMPING_BAND
 #define DEFAULT_DAMPING_BAND 3.0f   // +/- degrees C — reduce current in band
+#endif
+#ifndef DEFAULT_DAMPING_PCT
 #define DEFAULT_DAMPING_PCT  50     // % of max current inside damping band
+#endif
 
 // PID controller tuning. Output is in milliamps; setpoint and
 // measured temperature are in degrees Celsius. dt is fixed at
@@ -305,21 +520,33 @@
 // integral correction. Kd starts at 0 because derivative kick on
 // setpoint changes is rarely worth the noise on an NTC-driven
 // loop until the rest of the loop is well-behaved.
+#ifndef DEFAULT_KP
 #define DEFAULT_KP   200.0f
+#endif
+#ifndef DEFAULT_KI
 #define DEFAULT_KI     5.0f
+#endif
+#ifndef DEFAULT_KD
 #define DEFAULT_KD     0.0f
+#endif
 
 // Default control mode for first boot / EEPROM reset.
 //   true  → PID controller
 //   false → bang-bang + damping (simpler fallback law, reachable
 //           via the `pid` console command for A/B comparison or
 //           when PID tuning is going sideways)
+#ifndef DEFAULT_USE_PID
 #define DEFAULT_USE_PID  true
+#endif
 
 // Mode switch analog thresholds (10-bit ADC on A6).
 // Full scale = Heat, Mid = Auto, Ground = Cool.
+#ifndef MODE_THRESH_COOL
 #define MODE_THRESH_COOL     256    // below this = Cool
+#endif
+#ifndef MODE_THRESH_AUTO
 #define MODE_THRESH_AUTO     768    // below this = Auto, above = Heat
+#endif
 
 // NTC temperature conversion — placeholder linear model.
 // T(C) = raw_ADC * NTC_SCALE + NTC_OFFSET

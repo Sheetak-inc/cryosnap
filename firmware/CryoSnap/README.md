@@ -12,7 +12,13 @@ for the default build.
 1. Open `CryoSnap.ino` in the Arduino IDE.
 2. Select **Arduino Nano** / **ATmega328P** from Tools → Board.
 3. Upload. Open the Serial Monitor at **115200 baud**.
-4. You should see a boot banner, I2C scan, and `--- status ---` block.
+4. You should see the version banner (e.g. `CryoSnap v0.7.11 REVA`)
+   followed by a couple of HUSB238 PD-negotiation lines. The default
+   build is intentionally terse — boot-time I2C scan, EEPROM
+   blank/loaded chatter, status dump, and PD-budget echo are silent.
+   Compile with `-DENABLE_VERBOSE_BOOT=1` and/or
+   `-DENABLE_I2C_BOOT_SCAN=1` for the chatty bring-up build, or
+   send `status` over serial at any time for the full snapshot.
 5. Type `help` + Enter to see all serial commands.
 
 Default control runs from physical inputs (pot = setpoint, A6 mode
@@ -31,7 +37,7 @@ translation unit — the "open and compile" story stays trivial.
 |---|---|
 | `CryoSnap.ino` | Main story: setup, loop, fast/100 ms/1 s task buckets. Reads top-to-bottom. |
 | `Config.h` | All tunables: pins, defaults, safety limits, feature flags (`ENABLE_*`). The maker edits this to customize behavior. |
-| `Pins.h` | Board-target switch (`TARGET_PROTO` / `TARGET_REVA` / `TARGET_REVB`) exporting canonical `HW_*` pin names. |
+| `Pins.h` | Board-target switch (`TARGET_REVA` / `TARGET_REVB`) exporting canonical `HW_*` pin names. |
 | `Version.h` | Firmware version string + changelog. Bump on each release. |
 
 ### Control
@@ -88,8 +94,10 @@ buckets in `loop()`:
   button debounce, mode switch read, pot → setpoint.
 - **100 ms control task** (`LOOP_INTERVAL_MS`): NTC read, INA226
   read, fault gate, PID compute (or bang-bang + damping fallback),
-  TPS V/I limit, H-bridge direction, LED render, plotter line,
-  `ctrl_tick()` for the one-shot controller hook.
+  Seebeck wait state machine (cooperative, holds OE off for up to
+  3 s on a polarity flip without stalling the scheduler), TPS V/I
+  limit, H-bridge direction, LED render, plotter line, `ctrl_tick()`
+  for the one-shot controller hook.
 - **1 s slow task**: fan tach polling (blocks ~100 ms while timing
   edges), HUSB238 PD status re-check, OLED render, `task_diag()`
   cross-chip advisory checks.
@@ -104,14 +112,22 @@ moves to a Timer1 counter input.
 The 100 ms task runs one of two control laws based on `g_use_pid`:
 
 - **PID** — `pid_compute()` returns a signed mA command; sign maps
-  to H-bridge direction, magnitude to TPS current limit. Anti-windup
-  clamps the integrator so brief saturation events don't leave a
-  long-lived residual. Defaults are conservative (Kp=200, Ki=5,
-  Kd=0); see `PID.h` for the bench-tuning recipe.
+  to H-bridge direction, magnitude to TPS current limit. Conditional
+  integration plus an explicit mode-bound clamp keep the integrator
+  from accumulating in a direction the actuator can't use. Derivative
+  is taken on the measurement (not the error) so setpoint steps don't
+  produce a kick. Conservative starter defaults are `Kp=200 Ki=5 Kd=0`
+  (Config.h `DEFAULT_KP / DEFAULT_KI / DEFAULT_KD`); see `PID.h` for
+  the bench-tuning recipe, then `save` to persist your numbers.
 - **Bang-bang + damping** — simpler fallback control law, reachable
   via the `pid` console command for A/B comparison. Drives full
   current outside the damping band, scaled current inside, off
-  inside the deadband.
+  inside the deadband. Note: bang-bang combined with Mode `Auto`
+  produces limit-cycle oscillation around setpoint and will trigger
+  the Seebeck wait state machine on every crossing. For steady-state
+  regulation use Mode `Cool` or `Heat` (single-direction clamp) — or
+  switch to PID, which is structurally immune to this interaction at
+  the default tuning.
 
 Switch live: `pid` toggles, `pid 1` forces PID, `pid 0` forces
 bang-bang. `save` persists the choice to EEPROM.
@@ -173,11 +189,8 @@ operator runs `save` once.
 
 Set `BUILD_TARGET` in `Pins.h` (default is `TARGET_REVA`):
 
-- **`TARGET_PROTO`** — bench breadboard prototype. Uses the pin
-  values in Config.h, TPS55288 at I2C 0x75, inverted H-bridge
-  polarity.
 - **`TARGET_REVA`** — first-spin production PCB. Schematic-verified
-  pinout, TPS55288 at I2C 0x74, correct H-bridge polarity.
+  pinout, TPS55288 at I2C 0x74, H-bridge polarity bench-confirmed.
 - **`TARGET_REVB`** — next-spin production PCB. Same I2C address as
   Rev A but moves fan tach to D5 (Timer1 T1 input), INA Alert to D2,
   LED data to D4, and removes the discrete TPS fault pin (the chip
@@ -185,15 +198,20 @@ Set `BUILD_TARGET` in `Pins.h` (default is `TARGET_REVA`):
 
 ## Footprint
 
-Default build (PID + OLED + diagnostics, all `ENABLE_*` flags on):
+Default build (PID + OLED + diagnostics + Seebeck SM; verbose-boot
+and I2C-scan default OFF):
 
 | Target | Flash | RAM |
 |---|---|---|
-| `TARGET_REVA` (default) | ~29 KB / 94% | ~770 B / 37% |
-| `TARGET_PROTO` / `TARGET_REVB` | within ~100 B of REVA | — |
+| `TARGET_REVA` (default) | 30696 B / 99.9% (24 B free) | 805 B / 39% |
+| `TARGET_REVB` | within ~100 B of REVA | — |
 | `MINIMAL_BUILD = 1` | ~22 KB / 71% | ~600 B / 29% |
 
-`MINIMAL_BUILD` in Config.h disables OLED, diagnostics, the LED
-frame, and the controller hook — useful when debugging or when you
-need headroom for new features. Individual `ENABLE_*` flags can be
-toggled the same way; see the recipe at the top of `Config.h`.
+The default REVA build is tight against the Nano's 30720 B ceiling.
+Adding a serial command or DIAG channel typically costs 50–200 B per
+feature. If a new addition pushes over, reclaim space by setting
+one of: `ENABLE_VERBOSE_BOOT=0` (already off by default; ~380 B),
+`ENABLE_I2C_BOOT_SCAN=0` (already off; ~300 B),
+`ENABLE_SEEBECK_TRACE=0` (drops the `DIAG: Seebeck` lines; ~150 B),
+or `SEEBECK_HB_OFF_MAX_MS=0` (removes the polarity-flip mitigation
+entirely; ~290 B). `MINIMAL_BUILD` is the all-at-once switch.

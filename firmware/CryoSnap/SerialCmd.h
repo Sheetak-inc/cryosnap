@@ -257,13 +257,30 @@ static void _cmd_execute(char* cmd) {
     if (g_enabled) {
       _enable_time = millis();
       _pd_reinit();
-      pid_reset();              // clear any stale integrator
+      _pid_full_reset();        // clear stale integral + derivative + dt history
       ctrl_on_enable();         // kick off armed schedule, if any
+#if ENABLE_SOFT_START
+      _ramp_armed = true;       // arm I_limit ramp; consumed at first actuating tick
+#endif
+#if SEEBECK_SM_ACTIVE
+      _have_last_dir = false;   // mirror button-enable path
+#if SEEBECK_MIN_SAME_DIR_MS > 0
+      _seebeck_last_done_ms = 0;
+#endif
+#endif
     }
     Serial.print(F("Enable:")); Serial.println(g_enabled ? '1' : '0');
   }
   else if (MATCH("set", 3)) {
-    if (_has_arg(cmd + 3)) g_setpoint = atof(cmd + 3);
+    if (_has_arg(cmd + 3)) {
+      g_setpoint = atof(cmd + 3);
+      // Reset PID state so the integrator doesn't carry residual from
+      // the old setpoint into the new tracking window. Unconditional
+      // (rather than gated on delta != 0) is cheaper in flash and
+      // operationally harmless — a re-typed same-value `set` just
+      // restarts convergence from current temp.
+      _pid_full_reset();
+    }
     Serial.print(F("SP=")); Serial.println(g_setpoint, 1);
   }
   else if (MATCH("fan", 3)) {
@@ -285,8 +302,14 @@ static void _cmd_execute(char* cmd) {
   }
   else if (MATCH("imax", 4)) {
     if (_has_arg(cmd + 4)) {
-      int v = atoi(cmd + 4);
-      if (v < 0) v = 0;
+      // Clamp BOTH ends before the uint16_t cast. atoi returns int;
+      // a bare cast on out-of-range positives wraps silently —
+      // imax 70000 became 4464 mA in the old code (BUG-009 / C-2
+      // in the 2026-06-03 audit). Upper bound is the TPS55288's
+      // encodable ceiling: 0.0635 V / 10 mOhm shunt = 6350 mA.
+      long v = atol(cmd + 4);
+      if (v < 0)    v = 0;
+      if (v > 6350) v = 6350;
       g_imax_mA = (uint16_t)v;
       tps_setCurrentLimit(g_imax_mA);
     }
@@ -294,8 +317,12 @@ static void _cmd_execute(char* cmd) {
   }
   else if (MATCH("vmax", 4)) {
     if (_has_arg(cmd + 4)) {
-      int v = atoi(cmd + 4);
-      if (v < 0) v = 0;
+      // Same wrap protection as imax. tps_setVoltageLimit also
+      // clamps internally to 20000 mV, but the unclamped value
+      // would still land in g_vmax_mV and persist through save.
+      long v = atol(cmd + 4);
+      if (v < 0)     v = 0;
+      if (v > 20000) v = 20000;
       g_vmax_mV = (uint16_t)v;
       tps_setVoltageLimit(g_vmax_mV);
     }
@@ -304,7 +331,7 @@ static void _cmd_execute(char* cmd) {
   else if (MATCH("mode", 4)) {
     if (_has_arg(cmd + 4)) {
       int v = atoi(cmd + 4);
-      if (v >= 0 && v <= 2) g_mode = (uint8_t)v;
+      if (v >= 0 && v <= 2) _set_mode((uint8_t)v);
     }
     Serial.print(F("Mode:"));
     Serial.println(g_mode == MODE_COOL ? F("Cool") :
@@ -378,7 +405,7 @@ static void _cmd_execute(char* cmd) {
     } else {
       g_use_pid = !g_use_pid;
     }
-    pid_reset();   // both directions of toggle benefit from a clean integrator
+    _pid_full_reset();   // both directions of toggle benefit from a clean integrator + dt history
     Serial.print(F("PID:")); Serial.println(g_use_pid ? '1' : '0');
   }
   else if (MATCH("kp", 2)) {

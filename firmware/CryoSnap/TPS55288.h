@@ -43,21 +43,66 @@
 #define TPS_MODE_OE_BIT     0x80   // bit 7 of REG_MODE = output enable
 
 // ---- private I2C helpers (file-local) --------------------------------
+//
+// Wire.endTransmission() return codes:
+//   0 = success (ACK)
+//   2 = NACK on address
+//   3 = NACK on data
+//   4 = other error
+//   5 = timeout (some Wire implementations only)
+//
+// Marginal Vin during high-current TEC drive can cause individual
+// transactions to NACK even when the chip is otherwise alive on
+// the bus (tps_isPresent() probe still ACKs). Without tracking these,
+// _pd_reinit() / _tps_only_recover() can "succeed" by return value
+// while the writes silently didn't land — chip stays in whatever
+// state Phase-4-style residuals left it. Tracked in BUG-003
+// addendum v0.7.8 dated 2026-06-05.
 
-static inline void _tps_write(uint8_t reg, uint8_t val) {
+// True iff the most recent _tps_read() returned data the chip
+// actually drove. Reads that NACK (address or data phase) or fail
+// to deliver a byte set this false. Queried by callers that care
+// (e.g. tps_getVoltageLimitMV) to distinguish a real register
+// value of 0 from a transaction failure.
+static bool _tps_last_read_ok = true;
+
+// Returns Wire.endTransmission status — 0 = ACK, nonzero = NACK
+// or other I2C error. Callers that care about whether the write
+// actually landed should check; legacy callers can ignore (the
+// return is uint8_t, not a bool, so chaining `&&` works without
+// implicit narrowing).
+static inline uint8_t _tps_write(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(I2C_ADDR_TPS55288);
   Wire.write(reg);
   Wire.write(val);
-  Wire.endTransmission();
+  return Wire.endTransmission();
 }
 
+// Reads one register. Returns the byte the chip drove, or 0 on a
+// transaction failure. Use tps_lastReadOk() to distinguish a real
+// 0 from a NACK.
 static inline uint8_t _tps_read(uint8_t reg) {
   Wire.beginTransmission(I2C_ADDR_TPS55288);
   Wire.write(reg);
-  Wire.endTransmission(false);  // restart, hold the bus
+  uint8_t err = Wire.endTransmission(false);  // restart, hold the bus
+  if (err != 0) {
+    _tps_last_read_ok = false;
+    return 0;
+  }
   Wire.requestFrom((uint8_t)I2C_ADDR_TPS55288, (uint8_t)1);
-  return Wire.available() ? Wire.read() : 0;
+  if (!Wire.available()) {
+    _tps_last_read_ok = false;
+    return 0;
+  }
+  _tps_last_read_ok = true;
+  return Wire.read();
 }
+
+// True iff the most recent _tps_read() call delivered a byte the
+// chip actually drove (no NACK, no missing byte). Read-only query;
+// the flag flips on every _tps_read. Callers should check it
+// IMMEDIATELY after the read they care about.
+inline bool tps_lastReadOk() { return _tps_last_read_ok; }
 
 // ---- public API ------------------------------------------------------
 
@@ -65,7 +110,11 @@ static inline uint8_t _tps_read(uint8_t reg) {
 // 0.8 V..20 V range. The chip has four selectable feedback ranges
 // (5 / 10 / 15 / 20 V full scale); we pick the smallest range that
 // covers the requested voltage so the DAC step stays fine.
-inline void tps_setVoltageLimit(uint16_t mV) {
+// Returns true iff the VOUT_FS read AND all three register writes
+// (VOUT_FS, VREF_L, VREF_H) succeeded. A failed write means the chip
+// didn't latch the new V_limit; the caller's view of the chip state
+// will diverge from reality unless they check this return.
+inline bool tps_setVoltageLimit(uint16_t mV) {
   if (mV < 800)   mV = 800;
   if (mV > 20000) mV = 20000;
 
@@ -91,14 +140,21 @@ inline void tps_setVoltageLimit(uint16_t mV) {
   if (code > 0x03FF) code = 0x03FF;
 
   // Force internal feedback while preserving reserved bits in VOUT_FS.
+  // Early-return on read NACK: the read-modify-write contract is
+  // broken if we don't have a valid `fs` to modify. Writing the
+  // computed bits anyway would zero reserved bits the chip may
+  // care about (currently benign for VOUT_FS, but the pattern
+  // matters).
   uint8_t fs = _tps_read(TPS_REG_VOUT_FS);
+  if (!_tps_last_read_ok) return false;
   fs &= 0x7C;          // keep reserved bits, clear FB + INTFB
   fs |= sel->code;     // FB stays 0 -> internal feedback divider
-  _tps_write(TPS_REG_VOUT_FS, fs);
+  uint8_t e1 = _tps_write(TPS_REG_VOUT_FS, fs);
 
   // VREF_L must be written before VREF_H — writing high latches the DAC.
-  _tps_write(TPS_REG_VREF_L,  code & 0xFF);
-  _tps_write(TPS_REG_VREF_H, (code >> 8) & 0x03);
+  uint8_t e2 = _tps_write(TPS_REG_VREF_L,  code & 0xFF);
+  uint8_t e3 = _tps_write(TPS_REG_VREF_H, (code >> 8) & 0x03);
+  return (e1 == 0) && (e2 == 0) && (e3 == 0);
 }
 
 // Set the output current limit, in milliamps.
@@ -117,15 +173,36 @@ inline void tps_setVoltageLimit(uint16_t mV) {
 //
 // At TPS_RSENSE = 10 mOhm, max encodable current =
 //   0.0635 V / 0.010 Ohm = 6.35 A.
-inline void tps_setCurrentLimit(uint16_t mA) {
+// Returns true iff the IOUT_LIMIT write succeeded.
+inline bool tps_setCurrentLimit(uint16_t mA) {
   float v_sense = ((float)mA / 1000.0f) * TPS_RSENSE;  // V
   if (v_sense < 0.0f)    v_sense = 0.0f;
   if (v_sense > 0.0635f) v_sense = 0.0635f;            // 127 LSB cap
 
-  uint8_t steps = (uint8_t)(v_sense / 0.0005f);
+  // Round before the cast (+ 0.5f). Without rounding, 40 mA
+  // encoded to 0 steps (full dead-zone, controller can't drive
+  // sub-50 mA currents at all) and 2000 mA encoded to 39 steps
+  // = 1950 mA delivered. Rounding gives the closest valid step.
+  // (BUG-005 / PID-5 in the 2026-06-03 audit log.)
+  uint8_t steps = (uint8_t)(v_sense / 0.0005f + 0.5f);
 
   // Bit 7 enables the hardware current limiter.
-  _tps_write(TPS_REG_IOUT_LIMIT, 0x80 | (steps & 0x7F));
+  return _tps_write(TPS_REG_IOUT_LIMIT, 0x80 | (steps & 0x7F)) == 0;
+}
+
+// Cheap ACK probe — true if the chip is alive on the I2C bus.
+// The TPS55288 stops responding when its Vin browns out (the chip's
+// internal LDO can't sustain the I2C interface below UVLO), so a
+// NACK from this probe distinguishes "TPS lost its supply" from
+// "supply is insufficient to hold the commanded V_limit" — two
+// failure modes that look identical when reading registers because
+// Wire.read() returns 0 on a non-responding device. The supply
+// check in task_100ms uses this to skip the V_limit comparison
+// (which would otherwise false-trigger FAULT_NO_SUPPLY) when the
+// chip itself has dropped off the bus.
+inline bool tps_isPresent() {
+  Wire.beginTransmission(I2C_ADDR_TPS55288);
+  return (Wire.endTransmission() == 0);
 }
 
 // Read the *currently active* output voltage limit back from the chip,
@@ -139,10 +216,31 @@ inline void tps_setCurrentLimit(uint16_t mA) {
 // brief OE pulse is the firmware's only reliable signal that the
 // upstream supply (USB-PD or direct Vin) is actually adequate for
 // 12 V TEC drive.
+//
+// Returns TPS_VLIM_READ_FAIL (0xFFFF) sentinel if any of the three
+// register reads NACKs. Callers must treat the sentinel as "this
+// tick is unreliable, skip it" rather than as a 65535 mV reading —
+// otherwise a marginal-Vin transient (where the chip's address
+// probe ACKs but a follow-up read NACKs) would decode as ~200 mV
+// and increment the supply-fault counter for the wrong reason.
+// Tracked in BUG-003 addendum 2026-06-05.
+
+// Sentinel returned by tps_getVoltageLimitMV when any of its
+// register reads NACK. The TPS can't produce 65535 mV as a real
+// V_limit value (max is 20000 mV, capped by tps_setVoltageLimit),
+// so this is unambiguous. Defined BEFORE the function so the
+// function body can use the macro name rather than the bare
+// literal — if the sentinel value ever changes, only one place
+// needs updating.
+#define TPS_VLIM_READ_FAIL  0xFFFF
+
 inline uint16_t tps_getVoltageLimitMV() {
   uint8_t  vref_l  = _tps_read(TPS_REG_VREF_L);
+  if (!_tps_last_read_ok) return TPS_VLIM_READ_FAIL;
   uint8_t  vref_h  = _tps_read(TPS_REG_VREF_H);
+  if (!_tps_last_read_ok) return TPS_VLIM_READ_FAIL;
   uint8_t  vout_fs = _tps_read(TPS_REG_VOUT_FS);
+  if (!_tps_last_read_ok) return TPS_VLIM_READ_FAIL;
   static const float ratios[] = { 0.2256f, 0.1128f, 0.0752f, 0.0564f };
   uint16_t ref_code = (((uint16_t)(vref_h & 0x03)) << 8) | vref_l;
   float    ref_v    = 0.045f + (float)ref_code * 0.001129f;
@@ -151,12 +249,23 @@ inline uint16_t tps_getVoltageLimitMV() {
 }
 
 // Enable or disable the regulated TEC output rail. Read-modify-write
-// on REG_MODE so we don't disturb the other mode bits.
-inline void tps_setOutput(bool on) {
+// on REG_MODE so we don't disturb the other mode bits. Returns true
+// iff the MODE read AND the subsequent write both succeeded.
+inline bool tps_setOutput(bool on) {
   uint8_t mode = _tps_read(TPS_REG_MODE);
+  if (!_tps_last_read_ok) return false;
   if (on)  mode |=  TPS_MODE_OE_BIT;
   else     mode &= ~TPS_MODE_OE_BIT;
-  _tps_write(TPS_REG_MODE, mode);
+  return _tps_write(TPS_REG_MODE, mode) == 0;
+}
+
+// Read the CDC (Cable Droop Compensation) register. Used by the
+// drift-detect path in task_diag — if CDC has reverted to its
+// 0xE0 power-on default, the chip silently reset and tps_init's
+// 0xA0 (TPS_CDC_OPMODE) write didn't land. Returns 0 with
+// tps_lastReadOk() false on NACK.
+inline uint8_t tps_getCDC() {
+  return _tps_read(TPS_REG_CDC);
 }
 
 // Print every TPS55288 register to the given stream, annotated with
@@ -234,29 +343,44 @@ inline void tps_dump(Stream& out) {
 // Probe the chip and write conservative defaults. Output stays
 // DISABLED — call tps_setOutput(true) explicitly only after the rest
 // of the system has been gated by HUSB238 + fault checks.
+//
+// Returns true ONLY if the address ACK probed AND every register
+// write returned ACK. Marginal Vin during high-current TEC drive
+// can NACK individual writes even when the chip's address probe
+// still ACKs (BUG-003 addendum 2026-06-05). When this returns
+// false, the chip's register state is uncertain — callers should
+// preserve firmware-side state that maps to specific chip values
+// (supply counters, last-bad-mV) so a persistent supply problem
+// can still be diagnosed. EXCEPTION: g_pd_clamped is deliberately
+// cleared by the only caller (_tps_only_recover failure leg) so
+// the actuate gate doesn't starve the NACK fault path of fresh
+// failed writes — see the contract comment above _tps_only_recover
+// in CryoSnap.ino for the full rationale.
 inline bool tps_init() {
   // ACK probe first. If the chip isn't on the bus, bail early so the
   // caller can log a warning instead of silently doing nothing.
   Wire.beginTransmission(I2C_ADDR_TPS55288);
   if (Wire.endTransmission() != 0) return false;
 
+  bool ok = true;
+
   // Output OFF first (read-modify-write on REG_MODE clears OE).
-  tps_setOutput(false);
+  ok = tps_setOutput(false) && ok;
 
   // Mask the OCP fault indication on the FB/INT pin — see the
   // long comment above TPS_CDC_OPMODE for the why.
-  _tps_write(TPS_REG_CDC, TPS_CDC_OPMODE);
+  ok = (_tps_write(TPS_REG_CDC, TPS_CDC_OPMODE) == 0) && ok;
 
   // Start at the configured default max current (DEFAULT_MAX_CURRENT
   // from Config.h). The limiter is ON so the chip hardware-clamps at
   // this level until the control loop writes a different value.
-  tps_setCurrentLimit((uint16_t)(DEFAULT_MAX_CURRENT * 1000));
+  ok = tps_setCurrentLimit((uint16_t)(DEFAULT_MAX_CURRENT * 1000)) && ok;
 
   // 5 V starting voltage limit. Safe even if the output is somehow
   // enabled before the control loop sets V/I properly.
-  tps_setVoltageLimit(5000);
+  ok = tps_setVoltageLimit(5000) && ok;
 
-  return true;
+  return ok;
 }
 
 #endif // TPS55288_H
