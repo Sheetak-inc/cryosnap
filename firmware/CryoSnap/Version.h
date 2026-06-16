@@ -42,6 +42,27 @@
          (current-limit / low-rail is normal for a TEC). The INA is read
          only when the status bit is set, so the common path is unchanged.
 
+    Bench regression suite (logs/Bug-003 Addendum/, run via the monitor's
+    Run Test or run_test_headless.py — production commands only, no bench
+    build): test_heat_soak (continuous Heat soak), test_setpoint_regression
+    (steady-state high+low setpoint hold, Auto PID), and test_maxpower_flip
+    (max-power polarity-flip endurance). All drive the production control
+    loop and score the primary target FAULT[SCP] from latched fault reports.
+      - RESULT: the SCP fix HOLDS — no false FAULT[SCP] in any run. The heat
+        soak reached 45 C and held 300 s clean (0 SCP); the rail sat at the
+        ~0.8 V LOW-V flip floor repeatedly during regulation with the SCP
+        bit asserting but, post-fix, NOT latching (the INA corroboration
+        correctly reads it as a healthy low rail, not a short).
+      - Rig envelope (NOT a firmware issue): the bench heatsink + fan
+        dissipate ~50 W continuously; sustained MAX-power drive (6 A, ~68 W)
+        warms the heatsink to the external 60 C kill switch, which cuts the
+        supply (surfaces as FAULT[NOPSU], V_limit snapped to 5 V). Brief
+        max-power bursts and the LOW-V flip itself are fine; a sustained
+        max-power soak is bounded by cooling. The suite runs the fan (D5
+        tach now reads), keeps heat targets <= 45 C, uses plate-only
+        sensing (hot/ambient NTC unpopulated), and aborts on a plate-sensor
+        glitch so a bad NTC read can't make the loop over-drive.
+
   0.7.12  Seebeck LOW-V powered flip (Rev B) — replaces the OE-off wait
 
     Branched off v0.7.11. On the Rev B board the v0.7.11 OE-off
