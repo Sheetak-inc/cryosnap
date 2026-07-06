@@ -27,7 +27,7 @@
 #define TARGET_REVB   3
 
 #ifndef BUILD_TARGET
-  #define BUILD_TARGET TARGET_REVA
+  #define BUILD_TARGET TARGET_REVB
 #endif
 
 #include "Config.h"
