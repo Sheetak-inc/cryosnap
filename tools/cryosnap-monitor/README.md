@@ -20,15 +20,25 @@ Skip this if `python3` (Mac) or `python` (Windows) already runs from a terminal.
 2. On the first installer screen, check "Add python.exe to PATH", then "Install Now".
 
 **Mac**
-1. https://www.python.org/downloads/, download and run the installer. Or, if you use Homebrew: `brew install python3`.
+1. https://www.python.org/downloads/, download and run the installer. Or, if you use Homebrew:
+   ```
+   brew install python3
+   ```
 
 One-time setup, either way. The launcher scripts find Python automatically after this.
 
 ## Running it
 
-**Windows:** plug in the Nano, double-click `Run CryoSnap Monitor (Windows).bat`.
+**Windows:** plug in the Nano, double-click `Run_Windows.bat`.
 
-**Mac:** plug in the Nano, double-click `Run CryoSnap Monitor (Mac).command`. First run only, Gatekeeper will block it as "from an unidentified developer": right-click the file, choose Open, confirm once. Double-click works normally after that.
+**Mac:** plug in the Nano. The first time only, the launcher needs permission to
+run as a program. Open Terminal in this folder and run:
+```
+chmod +x Run_Mac.command
+```
+Then double-click `Run_Mac.command`. Gatekeeper will still block it once as
+"from an unidentified developer": right-click the file, choose Open, confirm.
+After that, double-click works normally every time.
 
 Either platform, the first run installs pyserial and matplotlib (about a minute, needs internet). After that it starts immediately. The window opens on your second monitor if you have one, serial terminal on the left, live graphs on the right.
 
@@ -87,15 +97,17 @@ CSV logs land in this folder as `cryosnap_log_YYYYMMDD_HHMMSS.csv`.
 - **"Python was not found"**: Python isn't installed, or (Windows) wasn't added
   to PATH during install, reinstall and check that box.
 - **Single monitor**: the window just opens on it; move/resize as normal.
-- **Mac Gatekeeper blocks the `.command` file every time**: this only happens
-  the very first launch. If it keeps happening, the executable bit may have
-  been stripped (e.g. by a zip/email round-trip); run `chmod +x "Run CryoSnap
-  Monitor (Mac).command"` once from Terminal in this folder.
+- **Mac Gatekeeper blocks `Run_Mac.command` every time, or it won't open at
+  all**: the executable bit is probably missing (common after a zip/email
+  round-trip). From Terminal in this folder:
+  ```
+  chmod +x Run_Mac.command
+  ```
 
 ## Files in this folder
 
-- `Run CryoSnap Monitor (Windows).bat`: Windows launcher, double-click to start
-- `Run CryoSnap Monitor (Mac).command`: Mac launcher, double-click to start
+- `Run_Windows.bat`: Windows launcher, double-click to start
+- `Run_Mac.command`: Mac launcher, double-click to start (run `chmod +x` on it first, see above)
 - `monitor_cryosnap.ps1`: what the Windows launcher calls (installs deps, starts the monitor)
 - `cryosnap_monitor.py`: the monitor program itself, same on both platforms
 - `tests/`: test scripts available from the Run Test button
