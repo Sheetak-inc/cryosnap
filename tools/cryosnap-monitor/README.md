@@ -34,7 +34,7 @@ One-time setup, either way. The launcher scripts find Python automatically after
 **Mac:** plug in the Nano. The first time only, the launcher needs permission to
 run as a program. Open Terminal in this folder and run:
 ```
-chmod +x Run_Mac.command
+sudo chmod u+x Run_Mac.command
 ```
 Then double-click `Run_Mac.command`. Gatekeeper will still block it once as
 "from an unidentified developer": right-click the file, choose Open, confirm.
