@@ -30,6 +30,14 @@ fi
 
 echo "Python found ($PYTHON)."
 
+# ── Create/activate virtual environment ────────────────────────────────────────
+VENV_DIR=".CryoSnap_venv"
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Creating virtual environment..."
+    "$PYTHON" -m venv "$VENV_DIR"
+fi
+source "$VENV_DIR/bin/activate"
+
 # ── Install / update dependencies ─────────────────────────────────────────────
 echo "Checking dependencies (pyserial, matplotlib) ..."
 "$PYTHON" -m pip install pyserial matplotlib --quiet --upgrade
