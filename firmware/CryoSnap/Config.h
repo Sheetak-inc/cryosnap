@@ -60,6 +60,9 @@
 //   ENABLE_DEBUG_DUMP_REGS    ~2400 B flash, 28 B RAM
 //       Verbose I2C register dump in `status` and at boot. Useful
 //       for hardware bring-up; turn off once silicon is verified.
+//       DEFAULT 0 SINCE v0.8.0: freed to fit ENABLE_NTC_LUT (main +
+//       LUT measured 464 B over the 30720 B limit with it on).
+//       THE BIG LEVER if a future build overflows flash.
 //
 //   ENABLE_EEPROM_SETTINGS    ~1100 B flash
 //       save / load / defaults serial commands and Settings.h.
@@ -69,9 +72,21 @@
 //       Walk every I2C address at boot and print devices found.
 //       Disable once the board is known-good.
 //
+//   ENABLE_NTC_LUT            ~450 B flash (104 B PROGMEM table +
+//       interpolation code). Nonlinear NTC conversion via a fitted
+//       lookup table — see NTC.h for the table provenance and the
+//       calibration application note for how to regenerate it for
+//       a different sensor. Set to 0 to fall back to the legacy
+//       linear model (which the 2026-08-28 bench fit measured 25 C
+//       wrong at 92 C true — legacy is a placeholder, not a
+//       calibration).
+//
 //   ENABLE_NTC_CALIBRATION    ~600 B flash
-//       cal / cal1 / cal2 / calshow serial commands. Disable after
-//       the NTC scale + offset are stored to EEPROM.
+//       cal / cal1 / cal2 / calshow serial commands. With the LUT
+//       enabled these solve a temperature-domain TRIM on top of
+//       the table (scale/offset, defaults 1.0/0.0) rather than the
+//       raw-domain line of the legacy model. Disable after the trim
+//       is stored to EEPROM.
 //
 //   ENABLE_SERIAL_PLOTTER     ~700 B flash
 //       Tab-separated plotter output in the 100 ms task plus the
@@ -193,6 +208,9 @@
   #define ENABLE_OLED_DISPLAY       0
   #define ENABLE_DIAGNOSTICS        0
   #define COMPACT_FAULT_MSGS        1
+  // MINIMAL_BUILD keeps the LUT: it is the calibration, not a
+  // convenience. Strip it only on a board with no fitted table.
+  #define ENABLE_NTC_LUT            1
   // SEEBECK_HB_OFF_MAX_MS=0 compiles the Seebeck wait state machine
   // out entirely (~290 B flash, 7 B RAM). MINIMAL_BUILD targets ship-
   // worthy firmware that has neither soft-start nor the polarity-flip
@@ -204,7 +222,10 @@
 #endif
 
 #ifndef ENABLE_DEBUG_DUMP_REGS
-#define ENABLE_DEBUG_DUMP_REGS    1
+// Default OFF since v0.8.0 to make room for ENABLE_NTC_LUT (~3 KB
+// freed, measured). Override with -DENABLE_DEBUG_DUMP_REGS=1 for a
+// hardware bring-up build.
+#define ENABLE_DEBUG_DUMP_REGS    0
 #endif
 #ifndef ENABLE_EEPROM_SETTINGS
 #define ENABLE_EEPROM_SETTINGS    1
@@ -216,6 +237,13 @@
 // ~300 B flash. Override with -DENABLE_I2C_BOOT_SCAN=1 when an
 // unexpected device may be on the bus.
 #define ENABLE_I2C_BOOT_SCAN      0
+#endif
+#ifndef ENABLE_NTC_LUT
+// Nonlinear NTC conversion via the fitted PROGMEM lookup table in
+// NTC.h. Default ON — this is the calibration. Set to 0 only for a
+// board/sensor with no fitted table, which restores the legacy
+// linear placeholder model.
+#define ENABLE_NTC_LUT            1
 #endif
 #ifndef ENABLE_NTC_CALIBRATION
 #define ENABLE_NTC_CALIBRATION    1
@@ -425,12 +453,14 @@
 #endif
 
 #ifndef ENABLE_SEEBECK_TRACE
-// Default ON when diagnostics are on. Emits a `DIAG: Seebeck V=x.xx
-// wait=NNNNms` line at each polarity-flip wait calculation, then a
-// `DIAG: Seebeck t V=x.xx` line every 100 ms tick during the wait
-// so the EMF decay curve is visible in the serial log. ~150 B flash.
-// Set to 0 in flash-tight builds; auto-zeroed under MINIMAL_BUILD.
-#define ENABLE_SEEBECK_TRACE      ENABLE_DIAGNOSTICS
+// Default OFF since v0.8.0 (diagnostic only; freed as part of the
+// NTC LUT flash budget). When ON, emits a `DIAG: Seebeck
+// V=x.xx wait=NNNNms` line at each polarity-flip wait calculation,
+// then a `DIAG: Seebeck t V=x.xx` line every 100 ms tick during the
+// wait so the EMF decay curve is visible in the serial log.
+// Override with -DENABLE_SEEBECK_TRACE=1 when debugging polarity-
+// flip behavior specifically.
+#define ENABLE_SEEBECK_TRACE      0
 #endif
 #ifndef COMPACT_FAULT_MSGS
 #define COMPACT_FAULT_MSGS        0
@@ -548,20 +578,33 @@
 #define MODE_THRESH_AUTO     768    // below this = Auto, above = Heat
 #endif
 
-// NTC temperature conversion — placeholder linear model.
-// T(C) = raw_ADC * NTC_SCALE + NTC_OFFSET
+// NTC temperature conversion constants.
 //
-// Calibrate by measuring two known temperatures (e.g. ice water
-// and body temp), reading the ADC values, and solving for SCALE
-// and OFFSET. Replace with Steinhart-Hart once the op-amp
-// conditioning circuit values are confirmed on production hardware.
+// With ENABLE_NTC_LUT = 1 (default): the curve SHAPE lives in the
+// PROGMEM lookup table in NTC.h, and these two constants are a
+// temperature-domain TRIM applied on top of it:
+//   T(C) = T_lut * NTC_SCALE + NTC_OFFSET
+// Identity defaults (1.0 / 0.0) mean "trust the table". The cal /
+// cal1 / cal2 serial commands adjust the trim at runtime and `save`
+// persists it. Regenerating the table (new sensor, new front end)
+// means resetting any saved trim: run `defaults` then `save` after
+// flashing a new table.
 //
-// The defaults below are empirical for the bench prototype's NTC +
-// op-amp network. Recalibrate if the NTC part or conditioning
-// circuit changes — the `cal1` / `cal2` two-point serial commands
-// compute fresh constants and persist them via `save`.
-#define NTC_SCALE    0.1023f  // degrees C per ADC count
-#define NTC_OFFSET  -27.6f   // degrees C at ADC = 0
+// With ENABLE_NTC_LUT = 0: legacy linear placeholder model,
+//   T(C) = raw_ADC * NTC_SCALE + NTC_OFFSET
+// using the LEGACY values below — empirical for the original bench
+// prototype and measured 25 C wrong at 92 C true on the 2026-08-28
+// bench fit. Placeholder only.
+#define NTC_SCALE_LEGACY    0.1023f  // degrees C per ADC count
+#define NTC_OFFSET_LEGACY  -27.6f    // degrees C at ADC = 0
+
+#if ENABLE_NTC_LUT
+#define NTC_SCALE    1.0f    // trim scale on the table output
+#define NTC_OFFSET   0.0f    // trim offset on the table output
+#else
+#define NTC_SCALE    NTC_SCALE_LEGACY
+#define NTC_OFFSET   NTC_OFFSET_LEGACY
+#endif
 
 // Enable button debounce time (milliseconds).
 #define BUTTON_DEBOUNCE_MS   50
@@ -588,6 +631,10 @@
 // To check on your board: probe AREF — if it's tied to a stable
 // 3.3 V (or other) source, keep this at 1. If AREF floats, set
 // to 0 and the firmware uses the default 5 V AVCC reference.
+//
+// NOTE for the LUT build: the lookup table was fitted with a 3.3 V
+// AREF. Changing the reference invalidates the table, not just the
+// scale — regenerate, do not trim.
 #define USE_EXTERNAL_AREF    1
 
 #endif // CONFIG_H

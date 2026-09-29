@@ -3,12 +3,45 @@
 
 // Firmware version — update on each meaningful change.
 #define FW_VERSION_MAJOR  0
-#define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  13
-#define FW_VERSION_STR    "0.7.13"
+#define FW_VERSION_MINOR  8
+#define FW_VERSION_PATCH  0
+#define FW_VERSION_STR    "0.8.0"
 
 /*
   Changelog (newest first):
+
+  0.8.0   Nonlinear NTC calibration via PROGMEM lookup table
+
+    The legacy linear NTC model (T = raw * 0.1023 - 27.6) was bench-
+    measured 25.4 C wrong at 92 C true against a Calex Excelog 6
+    Type K reference (2026-08-28 run, 169 quasi-steady points,
+    -4.3 to 95.2 C). The error is the model shape, not the sensor:
+    a straight line cannot follow an NTC divider over a 100 C span.
+
+    Changes:
+      - NTC.h: ENABLE_NTC_LUT conversion path. 26-entry PROGMEM
+        table (raw ADC, 0.1 C), binary search + linear interpolation.
+        Table encodes Amphenol curve F (TK95F103W) plus a fitted
+        deg-2 correction; residual 2.7 C max / 1.1 C RMS vs the
+        reference. Out-of-table reads return NAN (matches unwired-
+        channel semantics). Regenerate the table with fit_ntc_lut.py
+        for a different sensor or front end - never hand-edit.
+      - NTC_SCALE / NTC_OFFSET become a temperature-domain TRIM on
+        the table output (identity 1.0 / 0.0 defaults). Legacy
+        raw-domain model kept behind ENABLE_NTC_LUT=0.
+      - SerialCmd.h: cal / cal1 / cal2 solve the trim in temperature
+        domain (via new ntc_getLutC accessor); calshow prints the
+        untrimmed lut temperature per channel. Legacy build math
+        unchanged.
+      - Settings.h: SETTINGS_VERSION 3 -> 4. Layout unchanged, but
+        the ntc_scale/ntc_offset SEMANTICS changed; a v3 EEPROM
+        applied as trim would read ~-25 C at room temp. All fielded
+        EEPROMs invalidate; units boot at defaults until `save`.
+      - Config.h: ENABLE_NTC_LUT flag. Main + LUT measured 31184 B,
+        464 B over the 30720 B limit, so ENABLE_DEBUG_DUMP_REGS now
+        defaults to 0 (register dump in `status`/boot; bring-up
+        only). ENABLE_SEEBECK_TRACE defaults to 0 (diagnostic).
+        ENABLE_LED_FADE stays on. Measured build: 28364 B.
 
   0.7.13  Fix false FAULT[SCP] from the LOW-V flip floor
 
