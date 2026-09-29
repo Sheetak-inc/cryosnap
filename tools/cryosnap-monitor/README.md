@@ -6,7 +6,7 @@ commands to the device, and can log a session to CSV.
 
 ## Requirements
 
-- Windows or Mac
+- Windows, Mac, or Linux (including Raspberry Pi, 32-bit or 64-bit)
 - A CryoSnap Nano connected with a USB data cable (not a charge-only cable)
 - Python 3 (see below if you don't have it)
 - Internet access the first time you run it, to pull in pyserial and matplotlib
@@ -40,7 +40,17 @@ Then double-click `Run_Mac.command`. Gatekeeper will still block it once as
 "from an unidentified developer": right-click the file, choose Open, confirm.
 After that, double-click works normally every time.
 
-Either platform, the first run installs pyserial and matplotlib (about a minute, needs internet). After that it starts immediately. The window opens on your second monitor if you have one, serial terminal on the left, live graphs on the right.
+**Linux / Raspberry Pi:** plug in the Nano. Double-click `Run_Linux.sh` and choose
+"Execute in Terminal", or from a terminal in this folder run:
+```
+bash Run_Linux.sh
+```
+The first run installs Python packages with `apt` and may ask for your password.
+If your user can't open USB serial ports yet, it adds you to the `dialout` group
+and asks you to log out and back in once. The same launcher works on 32-bit and
+64-bit Raspberry Pi OS.
+
+Windows or Mac, the first run installs pyserial and matplotlib (about a minute, needs internet). After that it starts immediately. The window opens on your second monitor if you have one, serial terminal on the left, live graphs on the right.
 
 Windows may also show a blue "Windows protected your PC" box the first time, this is just because the script isn't signed: click "More info" -> "Run anyway".
 
@@ -108,6 +118,7 @@ CSV logs land in this folder as `cryosnap_log_YYYYMMDD_HHMMSS.csv`.
 
 - `Run_Windows.bat`: Windows launcher, double-click to start
 - `Run_Mac.command`: Mac launcher, double-click to start (run `chmod +x` on it first, see above)
+- `Run_Linux.sh`: Linux / Raspberry Pi launcher (32-bit or 64-bit)
 - `monitor_cryosnap.ps1`: what the Windows launcher calls (installs deps, starts the monitor)
-- `cryosnap_monitor.py`: the monitor program itself, same on both platforms
+- `cryosnap_monitor.py`: the monitor program itself, same on every platform
 - `tests/`: test scripts available from the Run Test button

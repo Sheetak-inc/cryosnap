@@ -114,10 +114,14 @@ STATUS_ACC = _StatusAcc()
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def find_port():
-    usb = [p for p in serial.tools.list_ports.comports()
-           if "USB" in (p.description or "")]
+    # Skip Linux onboard UARTs (Raspberry Pi ttyAMA0/ttyS0): never the Nano.
+    all_p = [p for p in serial.tools.list_ports.comports()
+             if not re.search(r"tty(AMA|S)\d+$", p.device)]
+    # Linux: the Nano enumerates as ttyACM* or ttyUSB*.
+    for p in all_p:
+        if re.search(r"tty(ACM|USB)\d+$", p.device): return p.device
+    usb = [p for p in all_p if "USB" in (p.description or "")]
     if usb: return usb[0].device
-    all_p = list(serial.tools.list_ports.comports())
     return all_p[0].device if all_p else None
 
 def parse_stream(line):
