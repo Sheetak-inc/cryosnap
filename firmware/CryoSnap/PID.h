@@ -246,5 +246,8 @@ inline void  pid_setKd(float v) { _pid_kd = v; }
 inline float pid_getKp() { return _pid_kp; }
 inline float pid_getKi() { return _pid_ki; }
 inline float pid_getKd() { return _pid_kd; }
+// Used by the Auto direction guard to undo one tick of integration.
+inline float pid_getIntegral()        { return _pid_integral; }
+inline void  pid_setIntegral(float v) { _pid_integral = v; }
 
 #endif // PID_H

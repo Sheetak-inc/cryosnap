@@ -51,9 +51,12 @@
     small per-unit shift can be corrected without reflashing; the
     curve SHAPE always comes from the table.
 
-    A raw reading outside the table returns NAN, which matches the
-    existing unwired-channel semantics: the OVERTEMP check compares
-    false on NAN, and a NAN control temperature parks the TEC.
+    A raw reading outside the table continues linearly along the end
+    segment (v0.9.0; it used to return NAN). Only an open sensor (raw
+    below NTC_RAW_OPEN, an unwired channel reads ~0) or a shorted one
+    (above NTC_RAW_SHORT) returns NAN, which keeps the unwired-channel
+    semantics: the OVERTEMP check compares false on NAN, and a NAN
+    control temperature parks the TEC.
 
   ENABLE_NTC_LUT = 0: legacy linear model.
     T(C) = raw_ADC * trim_scale + trim_offset
@@ -74,8 +77,35 @@
 
 #if ENABLE_NTC_LUT
 // ---------------------------------------------------------------
-// Calibration lookup table — PROGMEM, ~104 B.
+// Calibration lookup tables — PROGMEM, ~104 B. Config.h NTC_SENSOR
+// selects which one compiles in. Regenerate, never hand-edit: see the
+// NTC calibration application note (2026-09-01) and fit_ntc_lut.py.
 //
+#if NTC_SENSOR == NTC_SENSOR_MF55
+// PROVENANCE:
+//   Sensor:    Guangzhou Yueneng MF55, 10k +/-1% at 25 C,
+//              B25/50 = 3950 K +/-1% (stock CryoSnap kit sensor)
+//   Curve:     vendor R-T table "10K3950-150C" (Rnor), -30 to 125 C
+//   Fit:       deg-2 correction vs Huato S220-T8 type K (ch1, beside the
+//              MF55 on the cold plate), 15 hand-read 60 s holds,
+//              2026-09-30 and 2026-10-02, -5 to 80 C:
+//                corr = 0.000599 T^2 + 0.005862 T + 0.019
+//              max residual 0.60 C, rms 0.23 C. Outside -5..80 C the
+//              correction continues linearly on its end slope
+//              (+6.4 C at 100 C, +8.9 C at 125 C: extrapolated).
+//   Front end: R1=10k R2=4.75k R3=4.64k R4=68.1R, AREF=3.3 V,
+//              10-bit ADC (Rev B board, stock network)
+// ---------------------------------------------------------------
+#define NTC_LUT_N 32
+static const uint16_t NTC_LUT_RAW[NTC_LUT_N] PROGMEM = {
+     41,    59,    83,   111,   145,   186,   231,   282,   337,   394,   453,
+    511,   568,   622,   672,   718,   760,   797,   829,   857,   882,   903,
+    921,   937,   950,   962,   972,   980,   988,   994,   999,  1004 };
+static const int16_t  NTC_LUT_T10[NTC_LUT_N] PROGMEM = {  /* 0.1 C units */
+   -300,  -250,  -200,  -150,  -100,   -50,     0,    51,   101,   152,   204,
+    255,   307,   360,   412,   465,   518,   572,   625,   679,   734,   788,
+    843,   898,   953,  1008,  1064,  1119,  1174,  1229,  1284,  1339 };
+#elif NTC_SENSOR == NTC_SENSOR_TK95F
 // PROVENANCE (regenerate with fit_ntc_lut.py, do not hand-edit):
 //   Sensor:    Amphenol Thermometrics TK95F103W (10k, curve F)
 //   Curve:     AAS-913-318C Rev C p.12 material F
@@ -94,6 +124,9 @@ static const uint16_t NTC_LUT_RAW[NTC_LUT_N] PROGMEM = {
 static const int16_t  NTC_LUT_T10[NTC_LUT_N] PROGMEM = {  /* 0.1 C units */
   -185, -135,  -85,  -27,   31,   88,  145,  201,  257,  312,  366,  420,  473,
    525,  577,  628,  678,  728,  777,  825,  873,  920,  967, 1017, 1067, 1117 };
+#else
+#error "NTC_SENSOR must be NTC_SENSOR_MF55 or NTC_SENSOR_TK95F"
+#endif
 
 // Averaged-raw -> temperature via the table. Returns NAN when the
 // reading falls outside the table (unwired channel, shorted input,
@@ -101,13 +134,21 @@ static const int16_t  NTC_LUT_T10[NTC_LUT_N] PROGMEM = {  /* 0.1 C units */
 static float _ntc_lut_convert(float raw) {
   const uint16_t lo_raw = pgm_read_word(&NTC_LUT_RAW[0]);
   const uint16_t hi_raw = pgm_read_word(&NTC_LUT_RAW[NTC_LUT_N - 1]);
-  if (raw < lo_raw || raw > hi_raw) return NAN;
+  // Open (raw ~0) or shorted (raw 1023) sensor: no temperature.
+  if (raw < NTC_RAW_OPEN || raw > NTC_RAW_SHORT) return NAN;
 
-  // Binary search for the bracketing pair.
+  // Pick the bracketing pair. Outside the table, use the end segment so
+  // the reading continues linearly instead of dropping to NAN (v0.9.0).
   uint8_t lo = 0, hi = NTC_LUT_N - 1;
-  while (hi - lo > 1) {
-    uint8_t mid = (uint8_t)((lo + hi) >> 1);
-    if ((float)pgm_read_word(&NTC_LUT_RAW[mid]) <= raw) lo = mid; else hi = mid;
+  if (raw <= lo_raw) {
+    hi = 1;
+  } else if (raw >= hi_raw) {
+    lo = NTC_LUT_N - 2;
+  } else {
+    while (hi - lo > 1) {
+      uint8_t mid = (uint8_t)((lo + hi) >> 1);
+      if ((float)pgm_read_word(&NTC_LUT_RAW[mid]) <= raw) lo = mid; else hi = mid;
+    }
   }
   float r0 = (float)pgm_read_word(&NTC_LUT_RAW[lo]);
   float r1 = (float)pgm_read_word(&NTC_LUT_RAW[hi]);

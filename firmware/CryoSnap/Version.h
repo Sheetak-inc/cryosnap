@@ -2,13 +2,52 @@
 #define VERSION_H
 
 // Firmware version — update on each meaningful change.
-#define FW_VERSION_MAJOR  0
-#define FW_VERSION_MINOR  8
+#define FW_VERSION_MAJOR  2
+#define FW_VERSION_MINOR  0
 #define FW_VERSION_PATCH  0
-#define FW_VERSION_STR    "0.8.0"
+#define FW_VERSION_STR    "2.0.0"
 
 /*
   Changelog (newest first):
+
+  2.0.0   Stock-sensor calibration table + PID and converter fixes
+          (developed as 0.9.0; named v2 by Jon 2026-10-02)
+
+    Bench 2026-09-29/30, stock kit (MF55 sensor, Rev B), Claude over
+    serial. At 10 C the v0.8.0 defaults limit-cycled 7.4-12.6 C.
+
+    Changes:
+      - NTC.h / Config.h: NTC_SENSOR selects the compiled table.
+        NTC_SENSOR_MF55 (default, stock kit): Yueneng MF55 10k
+        B25/50=3950 vendor R-T table -30..125 C with a deg-2
+        correction fitted to 15 type K reference points, -5 to 80 C
+        (max residual 0.60 C, rms 0.23 C); the datasheet curve alone
+        read 4.1 C low at 80 C. NTC_SENSOR_TK95F: the v0.8.0 Vesna
+        table, unchanged.
+      - NTC.h: readings outside the table continue linearly on the
+        end segment instead of returning NAN. NAN only below
+        NTC_RAW_OPEN (20, open/unwired) or above NTC_RAW_SHORT (1015).
+      - DEFAULT_KI 5 -> 15. A below-ambient hold needs a steady
+        current that only the integral supplies.
+      - Deadband is bang-bang only. For PID it cut the holding
+        current at every approach to setpoint.
+      - PID direction guard (PID_FLIP_BAND_C 1.0 C, PID_FLIP_HOLD_MS
+        60 s between reversals, PID_FLIP_FORCE_C 5 C). Each Rev B
+        reversal's LOW-V flip drives ~1.1-1.5 A for ~2 s, moving the
+        plate ~2.5-3 C; unguarded Auto near ambient flipped 57 times
+        in 212 s. A setpoint within 1 C of ambient settles at ambient.
+      - TPS55288 light-load mode switching (TPS_FPWM_ON_MA 700 /
+        TPS_FPWM_OFF_MA 600). The MODE strap (R33 6.19k) selects PFM,
+        which follows I_limit to ~0.7 A but holds ~1.08 A for commands
+        of ~0.8-1.0 A. Forced PWM follows from ~0.6 A up but not
+        below ~0.5 A. Switching by drive level follows the command
+        within ~0.02 A (median) from 0 to 2 A.
+      - TPS_UNLATCH_* OE-drop workaround kept for bench use, default
+        off: it could not clear the latch at a 50 C heated hold.
+
+    Results (MF55 unit, imax 2000, Auto): 5/10/21/35/50 C holds
+    0.05-0.08 C sd, 50 C no longer cycles (was 1.86 C sd).
+    Flash 28932 B (MF55), 28908 B (TK95F).
 
   0.8.0   Nonlinear NTC calibration via PROGMEM lookup table
 

@@ -1321,8 +1321,13 @@ static void task_100ms() {
     float error_pos = t_cold - g_setpoint;     // positive = too hot
     float abs_err   = fabs(error_pos);
 
-    if (abs_err <= g_deadband) {
-      // Inside deadband — both controllers agree: TEC off.
+    // v0.9.0: the deadband only switches the TEC off for bang-bang.
+    // For PID it cut the holding current every time the loop reached
+    // setpoint, which on a hold away from ambient is a guaranteed limit
+    // cycle (bench 2026-09-29). PID never cuts the drive at setpoint;
+    // its reversals are gated by the direction guard below instead.
+    if (!g_use_pid && abs_err <= g_deadband) {
+      // Inside deadband — bang-bang: TEC off.
       drive_mA = 0;
       // Keep the PID derivative-on-measurement history fresh
       // even though we skipped pid_compute() — otherwise leaving
@@ -1380,7 +1385,29 @@ static void task_100ms() {
         case MODE_HEAT: out_min = 0.0f;              out_max = (float)g_imax_mA; break;
         default:        out_min = -(float)g_imax_mA; out_max = (float)g_imax_mA; break;  // AUTO
       }
+      float i_before = pid_getIntegral();
       float out = pid_compute(g_setpoint, t_cold, dt, out_min, out_max);
+
+      // Direction guard (v0.9.0) — see PID_FLIP_BAND_C in Config.h.
+      // Only Auto can reverse, so this is a no-op in Cool/Heat.
+      static int8_t        _pid_last_sign = 0;   // +1 heat, -1 cool, 0 none yet
+      static unsigned long _last_flip_ms  = 0;
+      static bool          _flipped_once  = false;
+      bool reverse = (out >  0.5f && _pid_last_sign < 0) ||
+                     (out < -0.5f && _pid_last_sign > 0);
+      if (reverse) {
+        bool rested = !_flipped_once || (now - _last_flip_ms >= PID_FLIP_HOLD_MS);
+        bool allow  = (abs_err > PID_FLIP_FORCE_C) ||
+                      (rested && abs_err > PID_FLIP_BAND_C);
+        if (allow) {
+          _last_flip_ms = now; _flipped_once = true;
+        } else {
+          out = 0.0f;                  // hold off, don't reverse yet
+          pid_setIntegral(i_before);   // and don't wind toward it
+        }
+      }
+      if (out >  0.5f) _pid_last_sign =  1;
+      if (out < -0.5f) _pid_last_sign = -1;
 
       if (out > 0.5f) {
         drive_dir = HB_HEAT;
@@ -1737,6 +1764,32 @@ static void task_100ms() {
 #endif
   {
   if (tec_on) {
+#if TPS_UNLATCH_MARGIN_MA > 0
+    // TPS55288 current latch workaround — see Config.h. ina_i was read
+    // at the top of this tick, so it reflects LAST tick's command.
+    static uint16_t _unlatch_prev_mA = 0;
+    static uint8_t  _unlatch_cnt     = 0;
+    bool unlatch = false;
+    if (!g_pd_clamped && _unlatch_prev_mA > 0 &&
+        fabs(ina_i) * 1000.0f > (float)_unlatch_prev_mA + TPS_UNLATCH_MARGIN_MA) {
+      if (++_unlatch_cnt >= TPS_UNLATCH_TICKS) { unlatch = true; _unlatch_cnt = 0; }
+    } else {
+      _unlatch_cnt = 0;
+    }
+#endif
+#if TPS_FPWM_ON_MA > 0
+    // Light-load mode by drive level — see TPS_FPWM_ON_MA in Config.h.
+    // Written only on a change, so steady state costs no I2C traffic.
+    {
+      static bool _fpwm = false, _fpwm_set = false;
+      bool want = _fpwm;
+      if (drive_mA >= TPS_FPWM_ON_MA)      want = true;
+      else if (drive_mA < TPS_FPWM_OFF_MA) want = false;
+      if (!_fpwm_set || want != _fpwm) {
+        if (tps_setFPWM(want)) { _fpwm = want; _fpwm_set = true; }
+      }
+    }
+#endif
     // Track whether the V/I writes actually landed. If they NACK
     // (marginal Vin during high-current drive), the chip is still
     // at whatever it was previously holding — leaving
@@ -1820,8 +1873,23 @@ static void task_100ms() {
 #else
     hb_safeDirectionChange(drive_dir);
 #endif
+#if TPS_UNLATCH_MARGIN_MA > 0
+    if (unlatch) {
+      tps_setOutput(false);             // one-tick drop; next tick re-enables
+      _tried_drive_last_tick = false;   // not a drive attempt for the supply check
+      _unlatch_prev_mA = 0;             // skip the compare on the re-enable tick
+#if ENABLE_DIAGNOSTICS
+      Serial.println(F("DIAG: TPS unlatch"));
+#endif
+    } else
+#endif
+    {
     writes_ok &= tps_setOutput(true);
     _tried_drive_last_tick = writes_ok;   // arm the supply-Vlim check for next tick
+#if TPS_UNLATCH_MARGIN_MA > 0
+    _unlatch_prev_mA = drive_mA;
+#endif
+    }
     // Persistent-NACK tracking (BUG-003 addendum follow-up): if
     // writes_ok stayed false for TPS_NACK_FAULT_DEBOUNCE consecutive
     // ticks, the fault chain latches NOPSU below. Without this, the

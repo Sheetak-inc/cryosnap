@@ -245,6 +245,83 @@
 // linear placeholder model.
 #define ENABLE_NTC_LUT            1
 #endif
+// Which sensor's table NTC.h compiles in (one table, so no flash cost
+// for having both):
+//   NTC_SENSOR_MF55   stock kit sensor: Guangzhou Yueneng MF55, 10k,
+//                     B25/50 = 3950. Vendor R-T table, no fit.
+//   NTC_SENSOR_TK95F  Amphenol TK95F103W (Vesna microscope stage),
+//                     curve F + the 2026-08-28 fitted correction.
+#define NTC_SENSOR_MF55   1
+#define NTC_SENSOR_TK95F  2
+#ifndef NTC_SENSOR
+#define NTC_SENSOR  NTC_SENSOR_MF55
+#endif
+// Raw ADC limits for a usable reading (v0.9.0). Below NTC_RAW_OPEN the
+// sensor is open or unwired (reads ~0); above NTC_RAW_SHORT it is
+// shorted (reads 1023). Between them a reading outside the table is
+// extrapolated on the end segment instead of returning NAN.
+#ifndef NTC_RAW_OPEN
+#define NTC_RAW_OPEN    20
+#endif
+#ifndef NTC_RAW_SHORT
+#define NTC_RAW_SHORT   1015
+#endif
+// TPS55288 current latch workaround (v0.9.0). Bench 2026-09-30: once the
+// TEC current passes ~1 A the converter stops following lower I_limit
+// writes and holds ~1.08 A (output floored near 2 V) until OE drops,
+// even though the IOUT_LIMIT register reads back the lower value. When
+// the measured current exceeds the previous tick's command by
+// TPS_UNLATCH_MARGIN_MA for TPS_UNLATCH_TICKS ticks in a row, OE drops
+// for one tick (same direction, the same OE-off that every drive->0
+// already does) and the next tick re-enables into regulation.
+// 0 compiles the workaround out.
+// Direction guard for PID (v0.9.0). A TEC reversal is allowed when
+// the error on the new side exceeds PID_FLIP_FORCE_C, or, once
+// PID_FLIP_HOLD_MS has passed since the last reversal, when it exceeds
+// PID_FLIP_BAND_C. Otherwise the drive holds at zero and the integrator
+// is frozen, so a setpoint within PID_FLIP_BAND_C of ambient settles at
+// ambient. (A "reverse after waiting 60 s" clause was tried and removed:
+// with ambient 0.3 C past setpoint it flipped every minute, each flip
+// pulse costing ~2.5 C, bench 2026-09-30.) The minimum interval matters because
+// one reversal's own pulse moves the stock plate ~3 C (22.4 -> 25.6 C,
+// bench 2026-09-30), which a band alone cannot absorb (40 flips).
+// Why: every Rev B reversal runs the LOW-V powered flip, which drives
+// ~1.1-1.4 A for ~2.4 s whatever the command (bench 2026-09-30). Near
+// ambient, where the hold needs only tens of mA, an unguarded Auto
+// loop turned each flip into the next overshoot: 57 flips in 212 s,
+// +/-2 C at a 21 C setpoint. Cool/Heat modes never reverse.
+#ifndef PID_FLIP_BAND_C
+#define PID_FLIP_BAND_C     1.0f
+#endif
+#ifndef PID_FLIP_HOLD_MS
+#define PID_FLIP_HOLD_MS    60000UL
+#endif
+#ifndef PID_FLIP_FORCE_C
+#define PID_FLIP_FORCE_C    5.0f
+#endif
+// Default OFF since the PFM/FPWM switching below removes the latch; at
+// a 50 C heated hold in PFM the OE drop could not clear it and made the
+// cycle worse. Kept for bench use.
+#ifndef TPS_UNLATCH_MARGIN_MA
+#define TPS_UNLATCH_MARGIN_MA   0
+#endif
+#ifndef TPS_UNLATCH_TICKS
+#define TPS_UNLATCH_TICKS       3
+#endif
+// TPS55288 light-load mode switching (v0.9.0, bench 2026-09-30). The
+// strap (R33 6.19k) puts the converter in PFM, which tracks I_limit up
+// to ~0.7 A but holds ~1.08 A for commands of ~0.8-1.0 A: the latch
+// above (50 C held +/-1.9 C; 5 C needed 259 OE resets in 10 min).
+// Forced PWM tracks from ~0.6 A up (50 C and 5 C both 0.07 C sd, zero
+// resets) but cannot hold commands below ~0.5 A (median 0.48 A
+// delivered for <0.1 A asked). So: FPWM at or above TPS_FPWM_ON_MA,
+// PFM below TPS_FPWM_OFF_MA. TPS_FPWM_ON_MA = 0 leaves the strap alone.
+#ifndef TPS_FPWM_ON_MA
+#define TPS_FPWM_ON_MA   700
+#endif
+#ifndef TPS_FPWM_OFF_MA
+#define TPS_FPWM_OFF_MA  600
+#endif
 #ifndef ENABLE_NTC_CALIBRATION
 #define ENABLE_NTC_CALIBRATION    1
 #endif
@@ -531,7 +608,7 @@
 // Keep this >= 0.1 C. Larger values (0.5-1.0 C) are quieter but give
 // less precise temperature tracking.
 #ifndef DEFAULT_DEADBAND
-#define DEFAULT_DEADBAND     0.2f   // +/- degrees C — TEC off inside band
+#define DEFAULT_DEADBAND     0.2f   // +/- degrees C — TEC off inside band (bang-bang only since v0.9.0)
 #endif
 
 #ifndef DEFAULT_DAMPING_BAND
@@ -553,8 +630,13 @@
 #ifndef DEFAULT_KP
 #define DEFAULT_KP   200.0f
 #endif
+// Ki = 15 since v0.9.0 (2026-09-29/30 bench, stock kit, MF55): a
+// hold below ambient needs a steady ~0.6 A that only the integral can
+// supply. At Ki = 5 it took minutes to build, so the drive fell to 0 at
+// every approach and the loop limit-cycled 7.4-12.6 C at a 10 C
+// setpoint; Ki = 15 held 9.99 C mean, 0.14 C sd.
 #ifndef DEFAULT_KI
-#define DEFAULT_KI     5.0f
+#define DEFAULT_KI    15.0f
 #endif
 #ifndef DEFAULT_KD
 #define DEFAULT_KD     0.0f
