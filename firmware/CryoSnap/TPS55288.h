@@ -251,6 +251,20 @@ inline uint16_t tps_getVoltageLimitMV() {
 // Enable or disable the regulated TEC output rail. Read-modify-write
 // on REG_MODE so we don't disturb the other mode bits. Returns true
 // iff the MODE read AND the subsequent write both succeeded.
+// Select the light-load mode by register: true = forced PWM, false = PFM.
+// Setting MODE bit 0 hands VCC / I2CADD / PFM to the register, so VCC
+// (bit 3) and I2CADD (bit 2) are written to the values the Rev B/C strap
+// selects (R33 = 6.19k: internal VCC, 74h) and only bit 1 differs.
+// Bench 2026-09-30: PFM tracks the I_limit to ~0.7 A but holds ~1.08 A
+// from ~0.8-1.0 A; FPWM tracks from ~0.6 A up but not below ~0.5 A.
+inline bool tps_setFPWM(bool fpwm) {
+  uint8_t mode = _tps_read(TPS_REG_MODE);
+  if (!_tps_last_read_ok) return false;
+  mode &= ~0x0E;                    // VCC internal, I2CADD 74h, PFM
+  mode |=  0x01 | (fpwm ? 0x02 : 0);
+  return _tps_write(TPS_REG_MODE, mode) == 0;
+}
+
 inline bool tps_setOutput(bool on) {
   uint8_t mode = _tps_read(TPS_REG_MODE);
   if (!_tps_last_read_ok) return false;

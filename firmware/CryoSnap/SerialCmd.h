@@ -35,6 +35,21 @@
   Per-write values are volatile until `save` writes them to EEPROM;
   `defaults` wipes the EEPROM and restores Config.h values.
 
+  NTC calibration commands and the LUT (since the 2026-09-01 build)
+  -----------------------------------------------------------------
+  With ENABLE_NTC_LUT = 1, the curve shape comes from the PROGMEM
+  table in NTC.h and cal / cal1 / cal2 solve a TRIM in temperature
+  domain on top of it:
+      T = T_lut * scale + offset      (identity 1.0 / 0.0 = "trust
+                                       the table")
+  cal1/cal2 sample the UNTRIMMED table temperature (ntc_getLutC) at
+  two known reference temperatures and solve scale + offset exactly.
+  `cal <C>` is the one-point version: keeps the current scale and
+  moves only the offset. Use the trim for a small per-unit shift; a
+  wrong SHAPE means the table needs regenerating, not trimming.
+  With ENABLE_NTC_LUT = 0 the same commands solve the legacy
+  raw-domain line, exactly as before.
+
   ---------------------------------------------------------------
   HOW TO ADD A NEW COMMAND
   ---------------------------------------------------------------
@@ -70,8 +85,19 @@ static uint8_t _cmd_len = 0;
 
 #if ENABLE_NTC_CALIBRATION
 // Two-point NTC calibration state (persists between cal1 and cal2 calls).
-static float _cal1_raw  = 0;
-static float _cal1_temp = 0;
+static float _cal1_raw  = 0;  // raw ADC at point 1 (too-close guard)
+static float _cal1_meas = 0;  // measured value at point 1: LUT temp (LUT
+                              // build) or raw ADC (legacy build)
+static float _cal1_temp = 0;  // reference temperature at point 1
+
+// The measured-domain sample the trim is solved against.
+static inline float _cal_measured() {
+#if ENABLE_NTC_LUT
+  return ntc_getLutC(1);      // untrimmed table temperature
+#else
+  return ntc_getRawAvg(1);    // raw ADC (legacy line is raw-domain)
+#endif
+}
 #endif
 
 static void _cmd_execute(char* cmd);
@@ -344,24 +370,37 @@ static void _cmd_execute(char* cmd) {
     for (uint8_t i = 1; i <= 3; ++i) {
       Serial.print(F("NTC")); Serial.print(i);
       Serial.print(F(" raw=")); Serial.print(ntc_getRawAvg(i), 1);
+#if ENABLE_NTC_LUT
+      Serial.print(F(" lut=")); Serial.print(ntc_getLutC(i), 2);
+#endif
       Serial.print(F(" T=")); Serial.println(ntc_getC(i), 1);
     }
   }
   else if (MATCH("cal1", 4) && cmd[4] == ' ') {
     _cal1_raw  = ntc_getRawAvg(1);
+    _cal1_meas = _cal_measured();
     _cal1_temp = atof(cmd + 5);
     Serial.print(F("P1 raw=")); Serial.print(_cal1_raw, 1);
+#if ENABLE_NTC_LUT
+    Serial.print(F(" lut=")); Serial.print(_cal1_meas, 2);
+#endif
     Serial.print(F(" T=")); Serial.println(_cal1_temp, 1);
   }
   else if (MATCH("cal2", 4) && cmd[4] == ' ') {
     float raw2  = ntc_getRawAvg(1);
+    float meas2 = _cal_measured();
     float temp2 = atof(cmd + 5);
     float dRaw = raw2 - _cal1_raw;
     if (fabs(dRaw) < 10) {
       Serial.println(F("ERR: points too close"));
     } else {
-      float new_scale  = (temp2 - _cal1_temp) / dRaw;
-      float new_offset = _cal1_temp - _cal1_raw * new_scale;
+      // Solve T = meas * scale + offset through both points.
+      // LUT build: meas is the untrimmed table temperature, so
+      // scale/offset are the temperature-domain trim (identity =
+      // perfect table). Legacy build: meas is raw ADC and this is
+      // the original raw-domain line, unchanged.
+      float new_scale  = (temp2 - _cal1_temp) / (meas2 - _cal1_meas);
+      float new_offset = _cal1_temp - _cal1_meas * new_scale;
       ntc_setScale(new_scale);
       ntc_setOffset(new_offset);
       Serial.print(F("scale=")); Serial.print(new_scale, 6);
@@ -369,9 +408,9 @@ static void _cmd_execute(char* cmd) {
     }
   }
   else if (MATCH("cal", 3) && cmd[3] == ' ') {
+    // One-point: keep the current scale, move only the offset.
     float actual = atof(cmd + 4);
-    float raw    = ntc_getRawAvg(1);
-    float new_offset = actual - raw * ntc_getScale();
+    float new_offset = actual - _cal_measured() * ntc_getScale();
     ntc_setOffset(new_offset);
     Serial.print(F("off=")); Serial.println(new_offset, 2);
   }

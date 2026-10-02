@@ -2,13 +2,85 @@
 #define VERSION_H
 
 // Firmware version — update on each meaningful change.
-#define FW_VERSION_MAJOR  0
-#define FW_VERSION_MINOR  7
-#define FW_VERSION_PATCH  13
-#define FW_VERSION_STR    "0.7.13"
+#define FW_VERSION_MAJOR  2
+#define FW_VERSION_MINOR  0
+#define FW_VERSION_PATCH  0
+#define FW_VERSION_STR    "2.0.0"
 
 /*
   Changelog (newest first):
+
+  2.0.0   Stock-sensor calibration table + PID and converter fixes
+          (developed as 0.9.0; named v2 by Jon 2026-10-02)
+
+    Bench 2026-09-29/30, stock kit (MF55 sensor, Rev B), Claude over
+    serial. At 10 C the v0.8.0 defaults limit-cycled 7.4-12.6 C.
+
+    Changes:
+      - NTC.h / Config.h: NTC_SENSOR selects the compiled table.
+        NTC_SENSOR_MF55 (default, stock kit): Yueneng MF55 10k
+        B25/50=3950 vendor R-T table -30..125 C with a deg-2
+        correction fitted to 15 type K reference points, -5 to 80 C
+        (max residual 0.60 C, rms 0.23 C); the datasheet curve alone
+        read 4.1 C low at 80 C. NTC_SENSOR_TK95F: the v0.8.0 Vesna
+        table, unchanged.
+      - NTC.h: readings outside the table continue linearly on the
+        end segment instead of returning NAN. NAN only below
+        NTC_RAW_OPEN (20, open/unwired) or above NTC_RAW_SHORT (1015).
+      - DEFAULT_KI 5 -> 15. A below-ambient hold needs a steady
+        current that only the integral supplies.
+      - Deadband is bang-bang only. For PID it cut the holding
+        current at every approach to setpoint.
+      - PID direction guard (PID_FLIP_BAND_C 1.0 C, PID_FLIP_HOLD_MS
+        60 s between reversals, PID_FLIP_FORCE_C 5 C). Each Rev B
+        reversal's LOW-V flip drives ~1.1-1.5 A for ~2 s, moving the
+        plate ~2.5-3 C; unguarded Auto near ambient flipped 57 times
+        in 212 s. A setpoint within 1 C of ambient settles at ambient.
+      - TPS55288 light-load mode switching (TPS_FPWM_ON_MA 700 /
+        TPS_FPWM_OFF_MA 600). The MODE strap (R33 6.19k) selects PFM,
+        which follows I_limit to ~0.7 A but holds ~1.08 A for commands
+        of ~0.8-1.0 A. Forced PWM follows from ~0.6 A up but not
+        below ~0.5 A. Switching by drive level follows the command
+        within ~0.02 A (median) from 0 to 2 A.
+      - TPS_UNLATCH_* OE-drop workaround kept for bench use, default
+        off: it could not clear the latch at a 50 C heated hold.
+
+    Results (MF55 unit, imax 2000, Auto): 5/10/21/35/50 C holds
+    0.05-0.08 C sd, 50 C no longer cycles (was 1.86 C sd).
+    Flash 28932 B (MF55), 28908 B (TK95F).
+
+  0.8.0   Nonlinear NTC calibration via PROGMEM lookup table
+
+    The legacy linear NTC model (T = raw * 0.1023 - 27.6) was bench-
+    measured 25.4 C wrong at 92 C true against a Calex Excelog 6
+    Type K reference (2026-08-28 run, 169 quasi-steady points,
+    -4.3 to 95.2 C). The error is the model shape, not the sensor:
+    a straight line cannot follow an NTC divider over a 100 C span.
+
+    Changes:
+      - NTC.h: ENABLE_NTC_LUT conversion path. 26-entry PROGMEM
+        table (raw ADC, 0.1 C), binary search + linear interpolation.
+        Table encodes Amphenol curve F (TK95F103W) plus a fitted
+        deg-2 correction; residual 2.7 C max / 1.1 C RMS vs the
+        reference. Out-of-table reads return NAN (matches unwired-
+        channel semantics). Regenerate the table with fit_ntc_lut.py
+        for a different sensor or front end - never hand-edit.
+      - NTC_SCALE / NTC_OFFSET become a temperature-domain TRIM on
+        the table output (identity 1.0 / 0.0 defaults). Legacy
+        raw-domain model kept behind ENABLE_NTC_LUT=0.
+      - SerialCmd.h: cal / cal1 / cal2 solve the trim in temperature
+        domain (via new ntc_getLutC accessor); calshow prints the
+        untrimmed lut temperature per channel. Legacy build math
+        unchanged.
+      - Settings.h: SETTINGS_VERSION 3 -> 4. Layout unchanged, but
+        the ntc_scale/ntc_offset SEMANTICS changed; a v3 EEPROM
+        applied as trim would read ~-25 C at room temp. All fielded
+        EEPROMs invalidate; units boot at defaults until `save`.
+      - Config.h: ENABLE_NTC_LUT flag. Main + LUT measured 31184 B,
+        464 B over the 30720 B limit, so ENABLE_DEBUG_DUMP_REGS now
+        defaults to 0 (register dump in `status`/boot; bring-up
+        only). ENABLE_SEEBECK_TRACE defaults to 0 (diagnostic).
+        ENABLE_LED_FADE stays on. Measured build: 28364 B.
 
   0.7.13  Fix false FAULT[SCP] from the LOW-V flip floor
 

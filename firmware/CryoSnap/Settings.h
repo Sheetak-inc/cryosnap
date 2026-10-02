@@ -48,11 +48,23 @@
   settings_load() will treat an older version as invalid and the
   next settings_save() overwrites with the new format.
 
+  VERSION 4 (2026-09-01, the LUT build): the struct LAYOUT is
+  unchanged, but the MEANING of ntc_scale / ntc_offset changed from
+  the legacy raw-domain line (0.1023 / -27.6) to a temperature-
+  domain trim on the lookup table (identity 1.0 / 0.0). A v3 EEPROM
+  loaded into LUT firmware would apply 0.1023/-27.6 as a trim and
+  read ~-25 C at room temperature, so the version bump is a
+  correctness requirement here, not bookkeeping. All fielded v3
+  EEPROMs are invalidated: units boot at Config.h defaults after
+  the upgrade and lose saved tuning until the operator runs `save`
+  again. Semantics changes invalidate EEPROMs exactly like layout
+  changes do.
+
   The Arduino Nano has 1 KB of EEPROM. This struct uses ~36 bytes.
 */
 
 #define SETTINGS_MAGIC    0xABCD
-#define SETTINGS_VERSION  3   // bump on any layout change to invalidate old EEPROMs
+#define SETTINGS_VERSION  4   // bump on any layout OR semantics change to invalidate old EEPROMs
 #define SETTINGS_ADDR     0
 
 struct SavedSettings {
@@ -74,7 +86,8 @@ struct SavedSettings {
   float    kp;
   float    ki;
   float    kd;
-  // NTC calibration
+  // NTC calibration trim (v4: temperature-domain trim on the LUT;
+  // raw-domain line when ENABLE_NTC_LUT=0)
   float    ntc_scale;
   float    ntc_offset;
   // checksum (last field)
