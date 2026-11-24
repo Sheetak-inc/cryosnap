@@ -2,7 +2,7 @@
 
 Drive a Sheetak MicroCENTUM micro thermoelectric cooler from a stock CryoSnap
 development kit: the same board, heat sink, fan and sensor, with a firmware
-profile tuned for the cooler's low voltage and fast thermal response.
+version tuned for the cooler's low voltage and fast thermal response.
 
 ## What it does
 
@@ -19,25 +19,21 @@ different voltage limit set at startup (below).
 
 ## Wiring
 
-Connect the MicroCENTUM to the **H-bridge bypass terminals** only. The profile
+Connect the MicroCENTUM to the **H-bridge bypass terminals** only. This version
 locks the controller in Cool mode with fixed polarity; Heat and Auto are
 disabled.
 
 ## Firmware
 
-Use the standard CryoSnap firmware in [`firmware/CryoSnap/`](../../firmware/CryoSnap/)
-with the MicroCENTUM profile. In `Profile.h`, set:
+Use the **MicroCENTUM MC-18** version of the firmware: download
+`cryosnap-v<version>-microcentum-mc18` (`.hex` or `.zip`) from the
+[latest release](https://github.com/Sheetak-inc/cryosnap/releases/latest), or
+open [`firmware/microcentum-mc18/CryoSnap/`](../../firmware/microcentum-mc18/CryoSnap/)
+in the Arduino IDE. It is ready to upload; nothing to edit.
 
-```c
-#define CRYOSNAP_PROFILE  PROFILE_MICROCENTUM_MC18
-```
+This version changes these defaults from the stock kit:
 
-or download the prebuilt `-mc18` firmware from the
-[latest release](https://github.com/Sheetak-inc/cryosnap/releases/latest).
-
-The profile changes these defaults from the stock kit:
-
-| Setting | Stock kit | MC-18 profile |
+| Setting | Stock kit | MC-18 version |
 |---|---|---|
 | Current limit | 2.0 A | 1.7 A |
 | Voltage limit | 12 V | 2.28 V |

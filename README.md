@@ -8,10 +8,10 @@ CryoSnap is a Sheetak thermoelectric validation platform for moving from bench t
 
 ## Start here
 
-- **Update your kit's firmware:** download the `.hex` for your setup from the
-  [latest release](https://github.com/Sheetak-inc/cryosnap/releases/latest),
-  or build from source with the Arduino IDE
-  ([firmware/CryoSnap/](firmware/CryoSnap/README.md)).
+- **Update your kit's firmware:** pick your version in [firmware/](firmware/),
+  then download it from the
+  [latest release](https://github.com/Sheetak-inc/cryosnap/releases/latest)
+  (prebuilt `.hex`, or a `.zip` to open in the Arduino IDE). Nothing to edit.
 - **First use:** [docs/getting-started.md](docs/getting-started.md) and
   [docs/safety.md](docs/safety.md).
 - **Log and plot data on a PC:** [tools/cryosnap-monitor/](tools/cryosnap-monitor/README.md).
@@ -21,18 +21,18 @@ CryoSnap is a Sheetak thermoelectric validation platform for moving from bench t
 
 | Folder | Contents |
 |---|---|
-| [`firmware/CryoSnap/`](firmware/CryoSnap/) | Arduino firmware. One source tree; `Profile.h` selects the hardware. |
-| [`applications/`](applications/) | Worked builds on top of the kit: firmware profile, parts and results. |
+| [`firmware/`](firmware/) | Arduino firmware, one ready-to-use folder per version: stock kit, MicroCENTUM MC-18, microscope stage. |
+| [`applications/`](applications/) | Worked builds on top of the kit: firmware version, parts and results. |
 | [`tools/`](tools/) | PC-side tools (CryoSnap Monitor). |
 | [`docs/`](docs/) | Getting started and safety. |
 | [`hardware/`](hardware/) | Hardware design files and their license terms. |
 
 ### Applications
 
-| Build | What it does | Firmware profile |
+| Build | What it does | Firmware version |
 |---|---|---|
-| [MicroCENTUM micro cooler](applications/microcentum/) | Drives a Sheetak MicroCENTUM MC-18 to −25 °C from the stock kit | `PROFILE_MICROCENTUM_MC18` |
-| [Microscope sample stage](applications/microscope-stage/) | Heats and cools a 35 mm petri dish under a microscope, −5 to 95 °C | `PROFILE_MICROSCOPE_STAGE` |
+| [MicroCENTUM micro cooler](applications/microcentum/) | Drives a Sheetak MicroCENTUM MC-18 to −25 °C from the stock kit | [`firmware/microcentum-mc18/`](firmware/microcentum-mc18/CryoSnap/) |
+| [Microscope sample stage](applications/microscope-stage/) | Heats and cools a 35 mm petri dish under a microscope, −5 to 95 °C | [`firmware/microscope-stage/`](firmware/microscope-stage/CryoSnap/) |
 
 
 ## License summary

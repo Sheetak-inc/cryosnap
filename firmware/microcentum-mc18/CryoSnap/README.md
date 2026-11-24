@@ -5,14 +5,14 @@ development platform. Compiles in the stock Arduino IDE against the
 ATmega328P (Arduino Nano Classic). No external libraries required
 for the default build.
 
-**Version:** see [`Version.h`](Version.h); release notes in [`CHANGELOG.md`](../../CHANGELOG.md)
+**Version:** see [`Version.h`](Version.h); release notes in [`CHANGELOG.md`](../../../CHANGELOG.md)
 
 ## Quick start
 
 1. Open `CryoSnap.ino` in the Arduino IDE.
-2. In `Profile.h`, pick your hardware: `PROFILE_STOCK` (the kit as
-   shipped, default), `PROFILE_MICROCENTUM_MC18` or
-   `PROFILE_MICROSCOPE_STAGE`. See [`applications/`](../../applications/).
+2. Nothing to select: this folder is already set up for one version
+   (stock kit, MicroCENTUM MC-18 or microscope stage). `Profile.h` says
+   which. Other versions are listed in [`firmware/`](https://github.com/Sheetak-inc/cryosnap/tree/main/firmware).
 3. Select **Arduino Nano** / **ATmega328P** from Tools → Board.
 4. Upload. Open the Serial Monitor at **115200 baud**.
 5. You should see the version banner (e.g. `CryoSnap v2.1.0 REVB`)
@@ -39,7 +39,7 @@ translation unit — the "open and compile" story stays trivial.
 | File | Purpose |
 |---|---|
 | `CryoSnap.ino` | Main story: setup, loop, fast/100 ms/1 s task buckets. Reads top-to-bottom. |
-| `Profile.h` | Build profile: the one line that selects stock kit, MicroCENTUM MC-18 or microscope stage. Profiles only change `Config.h` defaults. |
+| `Profile.h` | Which version this folder is (stock kit, MicroCENTUM MC-18 or microscope stage), and the defaults each version changes in `Config.h`. Already set; no need to edit. |
 | `Config.h` | All tunables: pins, defaults, safety limits, feature flags (`ENABLE_*`). The maker edits this to customize behavior. |
 | `Pins.h` | Board-target switch (`TARGET_REVA` / `TARGET_REVB`) exporting canonical `HW_*` pin names. |
 | `Version.h` | Firmware version string + changelog. Bump on each release. |

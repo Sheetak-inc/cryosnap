@@ -35,16 +35,12 @@ resolution, for runs of five minutes to an hour.
 
 ## Firmware
 
-Use the standard CryoSnap firmware in [`firmware/CryoSnap/`](../../firmware/CryoSnap/)
-with the microscope-stage profile. In `Profile.h`, set:
-
-```c
-#define CRYOSNAP_PROFILE  PROFILE_MICROSCOPE_STAGE
-```
-
-or download the prebuilt `-stage` firmware from the
-[latest release](https://github.com/Sheetak-inc/cryosnap/releases/latest).
-The profile turns on two things:
+Use the **microscope stage** version of the firmware: download
+`cryosnap-v<version>-microscope-stage` (`.hex` or `.zip`) from the
+[latest release](https://github.com/Sheetak-inc/cryosnap/releases/latest), or
+open [`firmware/microscope-stage/CryoSnap/`](../../firmware/microscope-stage/CryoSnap/)
+in the Arduino IDE. It is ready to upload; nothing to edit. This version turns
+on two things:
 
 - **Calibration for the Amphenol TK95F probe.** A 26-entry non-linear table
   indexed on raw ADC counts, with a fitted correction baked in. The two-point

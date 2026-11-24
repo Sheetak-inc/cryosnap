@@ -5,10 +5,10 @@ on the OLED status line.
 
 ## 2.1.0
 
-**Build profiles.** `firmware/CryoSnap/Profile.h` selects the hardware with one
-line. Prebuilt firmware for each profile is attached to the release.
+**One download per hardware version.** Pick your version in `firmware/` or on
+the release page; each is ready to upload, with nothing to select or edit.
 
-- **Stock** (default): the CryoSnap dev kit as shipped. Same behavior as 2.0.0.
+- **Stock**: the CryoSnap dev kit as shipped. Same behavior as 2.0.0.
 - **MicroCENTUM MC-18** (`-mc18`): drives a Sheetak MicroCENTUM micro cooler on
   the H-bridge bypass terminals. Cool mode only, 1.7 A / 2.28 V limits, PID
   tuned for the cooler's fast response, and a feedforward preload that starts
@@ -19,8 +19,8 @@ line. Prebuilt firmware for each profile is attached to the release.
   probe is out of the sample. See
   [`applications/microscope-stage/`](applications/microscope-stage/).
 
-Each profile keeps its own saved settings. Switching profiles on a board
-starts from that profile's defaults until you `save`.
+Each version keeps its own saved settings. Switching versions on a board
+starts from that version's defaults until you `save`.
 
 ## 2.0.0
 

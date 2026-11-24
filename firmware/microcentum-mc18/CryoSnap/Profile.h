@@ -2,30 +2,22 @@
 #define PROFILE_H
 
 // ============================================
-// Build profile — the one line to change
+// MicroCENTUM MC-18 version of CryoSnap v2.1.0
 // ============================================
-// Pick the hardware this firmware will drive, then compile and upload.
+// This folder is already set up for: MicroCENTUM MC-18.
+// Open CryoSnap.ino and upload. There is nothing to select.
+// Other versions: the firmware/ folder of the repository, or the
+// Releases page (one download per version).
 //
-//   PROFILE_STOCK             CryoSnap dev kit as shipped (MF55 sensor,
-//                             127-couple module, Cool / Heat / Auto).
-//   PROFILE_MICROCENTUM_MC18  Sheetak MicroCENTUM MC-18 micro cooler on
-//                             the H-bridge bypass terminals. Cool only.
-//                             See applications/microcentum/README.md.
-//   PROFILE_MICROSCOPE_STAGE  Temperature-controlled microscope sample
-//                             stage (Amphenol TK95F probe in the water,
-//                             pause / resume for lid-off imaging).
-//                             See applications/microscope-stage/README.md.
-//
-// A -DCRYOSNAP_PROFILE=... compiler flag overrides the line below.
-// Each profile only changes defaults; every value below can still be
-// overridden on its own with a -D flag.
+// The profile blocks below hold the defaults for every version;
+// only the one selected here is compiled.
 
 #define PROFILE_STOCK             0
 #define PROFILE_MICROCENTUM_MC18  1
 #define PROFILE_MICROSCOPE_STAGE  2
 
 #ifndef CRYOSNAP_PROFILE
-#define CRYOSNAP_PROFILE  PROFILE_STOCK
+#define CRYOSNAP_PROFILE  PROFILE_MICROCENTUM_MC18
 #endif
 
 // --------------------------------------------
