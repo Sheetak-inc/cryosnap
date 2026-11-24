@@ -5,7 +5,7 @@ nothing to select or edit before you upload it.
 
 | Version | Use it for | Source folder | Download |
 |---|---|---|---|
-| **Stock dev kit** | The CryoSnap kit as shipped (127-couple module, Cool / Heat / Auto) | [`stock/CryoSnap/`](stock/CryoSnap/) | [latest release](https://github.com/Sheetak-inc/cryosnap/releases/latest) |
+| **Stock dev kit** | The CryoSnap kit as shipped (71-couple module, Cool / Heat / Auto) | [`stock/CryoSnap/`](stock/CryoSnap/) | [latest release](https://github.com/Sheetak-inc/cryosnap/releases/latest) |
 | **MicroCENTUM MC-18** | A Sheetak MicroCENTUM micro cooler on the H-bridge bypass terminals ([application](../applications/microcentum/)) | [`microcentum-mc18/CryoSnap/`](microcentum-mc18/CryoSnap/) | [latest release](https://github.com/Sheetak-inc/cryosnap/releases/latest) |
 | **Microscope stage** | The temperature-controlled petri-dish stage ([application](../applications/microscope-stage/)) | [`microscope-stage/CryoSnap/`](microscope-stage/CryoSnap/) | [latest release](https://github.com/Sheetak-inc/cryosnap/releases/latest) |
 
