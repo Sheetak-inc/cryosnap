@@ -1,0 +1,5 @@
+*.pdf
+*.pages
+
+# Arduino IDE / arduino-cli build output
+build/
