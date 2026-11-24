@@ -25,7 +25,7 @@
 #define PROFILE_MICROSCOPE_STAGE  2
 
 #ifndef CRYOSNAP_PROFILE
-#define CRYOSNAP_PROFILE  PROFILE_STOCK
+#define CRYOSNAP_PROFILE  PROFILE_MICROSCOPE_STAGE   // microscope-stage branch: stage profile selected
 #endif
 
 // --------------------------------------------

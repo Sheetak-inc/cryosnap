@@ -1,5 +1,9 @@
 # CryoSnap
 
+> **Microscope-stage branch.** This branch is kept for published links. The
+> microscope stage build is in [`hardware/microscope-stage/`](hardware/microscope-stage/)
+> here and in [`applications/microscope-stage/`](https://github.com/Sheetak-inc/cryosnap/tree/main/applications/microscope-stage) on `main`.
+
 CryoSnap is a Sheetak thermoelectric validation platform for moving from bench testing to product integration faster. It is intended to help builders, engineers, researchers, and product teams start from a working TEC control system, collect useful thermal data earlier, and reuse validated architecture where appropriate.
 
 > **Status:** Public reference design / community edition.
